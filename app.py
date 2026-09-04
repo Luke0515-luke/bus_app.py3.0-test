@@ -22,6 +22,7 @@ from realtime_sync import pull_realtime_backup, push_realtime_backup
 import asyncio
 import threading
 import shutil
+import fcntl
 
 load_dotenv()
 
@@ -795,6 +796,7 @@ def fetch_bus_data(route_name):
     由後台統一更新的資料，也大幅減少對 TDX 的查詢量。
     只有在系統剛啟動、快照完全還是空的（例如第一次部署、還沒抓過任何資料）時，
     才退回直接查一次 TDX，避免使用者看到完全空白的畫面。"""
+    _ensure_realtime_cache_fresh()
     with _realtime_lock:
         by_route = _realtime_cache.get("eta_by_route") or {}
         data = by_route.get(route_name)
@@ -943,6 +945,7 @@ def fetch_bus_realtime_positions(route_name=None):
     """回傳即時公車 GPS 定位（不帶路線名稱＝全台南所有路線）。改成讀『後台排程
     每分鐘統一抓好』的共用快照，不再由每一個使用者的請求各自打一次 TDX。
     只有在系統剛啟動、快照完全還是空的時候，才退回直接查一次 TDX 當暫時的資料來源。"""
+    _ensure_realtime_cache_fresh()
     with _realtime_lock:
         by_route = _realtime_cache.get("positions_by_route") or {}
         has_data = bool(by_route)
@@ -962,6 +965,7 @@ def fetch_bus_realtime_positions(route_name=None):
 REALTIME_POSITIONS_FILE = os.path.join(REALTIME_DATA_DIR, "positions.json")
 REALTIME_ETA_FILE = os.path.join(REALTIME_DATA_DIR, "eta.json")
 REALTIME_META_FILE = os.path.join(REALTIME_DATA_DIR, "meta.json")
+REALTIME_LOCK_FILE = os.path.join(REALTIME_DATA_DIR, ".poll.lock")
 REALTIME_POLL_SECONDS = 60      # 每 1 分鐘抓一次
 REALTIME_STALE_SECONDS = 90     # 超過這個秒數還沒成功更新過，視為「尚未更新資料」
 
@@ -973,6 +977,7 @@ _realtime_cache = {
     "last_attempt": None,     # 最近一次「嘗試」更新的時間（不管成功與否）
     "last_attempt_ok": None,
 }
+_realtime_file_mtime = None  # 記憶體裡這份快照，是對應到「檔案」的哪個修改時間
 
 
 def get_realtime_status():
@@ -1019,9 +1024,48 @@ def _load_realtime_cache_from_disk():
         _realtime_cache["last_attempt_ok"] = meta.get("last_attempt_ok")
 
 
+def _ensure_realtime_cache_fresh():
+    """真正讓『使用者查詢一律從檔案抓資料』成立的關鍵：每次查詢前，先看一下
+    快照檔案（meta.json）的修改時間有沒有變新——不管是這個處理程序自己的
+    後台排程剛更新的，還是（部署成多個 worker process 時）另一個 worker
+    process 的排程更新的，只要檔案變新了，就重新讀一次檔案進記憶體。
+    平常檔案沒變的話，這裡只做一次很輕量的 os.stat()，不會整個重新讀寫，
+    所以正常查詢速度完全不受影響；但只要檔案有變，查詢一定拿到『檔案裡
+    最新那份』，不會有某個 worker 記憶體裡卡著舊資料的問題。"""
+    global _realtime_file_mtime
+    try:
+        mtime = os.path.getmtime(REALTIME_META_FILE)
+    except OSError:
+        return
+    if _realtime_file_mtime is None or mtime > _realtime_file_mtime:
+        _load_realtime_cache_from_disk()
+        _realtime_file_mtime = mtime
+
+
+def _acquire_realtime_poll_lock():
+    """如果之後改成多個 worker process 部署，避免每個 worker 都各自每分鐘
+    去打一次 TDX、各自 git push（互相打架、也失去『統一由後台抓一次』的意義）。
+    用 flock 非阻塞鎖：同一時間只有搶到鎖的那個 worker 真的去查 TDX、寫檔、
+    推送到 GitHub，其他 worker 這一輪直接跳過——反正上面的
+    _ensure_realtime_cache_fresh() 會讓它們之後查詢時，照樣讀得到別人剛剛
+    寫進（同一顆磁碟上）檔案裡的最新資料。單一 worker 部署時，這裡幾乎不會
+    有任何影響，每次都馬上搶得到鎖。"""
+    try:
+        os.makedirs(REALTIME_DATA_DIR, exist_ok=True)
+        fp = open(REALTIME_LOCK_FILE, "w")
+        fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fp
+    except BlockingIOError:
+        fp.close()
+        return None
+    except Exception:
+        return None
+
+
 def _write_realtime_snapshot(positions_by_route, eta_by_route, ok, attempted_at):
     """把這一輪抓到的定位／到站資料寫檔：每次都先刪掉舊檔，再整批寫入新的，
     確保資料夾裡永遠只留『最新這一份』快照，而不是累加、保留歷史檔案。"""
+    global _realtime_file_mtime
     try:
         os.makedirs(REALTIME_DATA_DIR, exist_ok=True)
         for path in (REALTIME_POSITIONS_FILE, REALTIME_ETA_FILE, REALTIME_META_FILE):
@@ -1037,6 +1081,12 @@ def _write_realtime_snapshot(positions_by_route, eta_by_route, ok, attempted_at)
                 "last_attempt": attempted_at,
                 "last_attempt_ok": ok,
             }, f, ensure_ascii=False)
+        # 這個 process 剛剛自己寫過檔案了，記憶體裡就是最新的，記下這個檔案時間，
+        # 避免下一次查詢時 _ensure_realtime_cache_fresh() 又白白重讀一次同樣的內容。
+        try:
+            _realtime_file_mtime = os.path.getmtime(REALTIME_META_FILE)
+        except OSError:
+            pass
     except Exception as e:
         print(f"⚠️ 寫入即時資料快照失敗：{e}", flush=True)
 
@@ -1048,46 +1098,58 @@ def _realtime_poll_once():
     抓到之後：① 依路線名稱分組、更新記憶體共用快取 ② 存檔（先清舊檔再整批換新）
     ③ 推送到 bus_app.py3.0backup 這個 repo 的 realtime-data 分支。
     只要這一輪完全沒抓到任何資料，就不更新 updated_at，讓 get_realtime_status()
-    能正確判斷『已經有一段時間沒有成功更新』，回傳給前端顯示「尚未更新資料」。"""
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    positions_all = _fetch_bus_realtime_positions_from_tdx(None)
-    eta_all = fetch_bus_data_all()
-    ok = bool(positions_all) or bool(eta_all)
-
-    positions_by_route = {}
-    for b in (positions_all or []):
-        r = (b.get("RouteName") or {}).get("Zh_tw", "")
-        if r:
-            positions_by_route.setdefault(r, []).append(b)
-
-    eta_by_route = {}
-    for item in (eta_all or []):
-        r = (item.get("RouteName") or {}).get("Zh_tw", "")
-        if r:
-            eta_by_route.setdefault(r, []).append(item)
-
-    with _realtime_lock:
-        if positions_all:
-            _realtime_cache["positions_by_route"] = positions_by_route
-        if eta_all:
-            _realtime_cache["eta_by_route"] = eta_by_route
-        if ok:
-            _realtime_cache["updated_at"] = now_str
-        _realtime_cache["last_attempt"] = now_str
-        _realtime_cache["last_attempt_ok"] = ok
-        snapshot_positions = dict(_realtime_cache["positions_by_route"])
-        snapshot_eta = dict(_realtime_cache["eta_by_route"])
-
-    _write_realtime_snapshot(snapshot_positions, snapshot_eta, ok, now_str)
-
+    能正確判斷『已經有一段時間沒有成功更新』，回傳給前端顯示「尚未更新資料」。
+    最前面先搶跨處理程序的鎖：部署成多個 worker process 時，只有搶到鎖的那個
+    worker 真的執行這一輪，其他 worker 直接跳過，避免大家都各自打一次 TDX。"""
+    lock_fp = _acquire_realtime_poll_lock()
+    if lock_fp is None:
+        return  # 已經有別的 worker 正在跑這一輪，這裡不用重複做
     try:
-        push_realtime_backup(REALTIME_DATA_DIR)
-    except Exception as e:
-        print(f"❌ 即時資料推送到 GitHub 失敗：{e}", flush=True)
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    print(f"{'✅' if ok else '⚠️'} 即時公車資料排程：定位 {len(positions_all or [])} 筆、"
-          f"到站預估 {len(eta_all or [])} 筆，時間 {now_str}", flush=True)
+        positions_all = _fetch_bus_realtime_positions_from_tdx(None)
+        eta_all = fetch_bus_data_all()
+        ok = bool(positions_all) or bool(eta_all)
+
+        positions_by_route = {}
+        for b in (positions_all or []):
+            r = (b.get("RouteName") or {}).get("Zh_tw", "")
+            if r:
+                positions_by_route.setdefault(r, []).append(b)
+
+        eta_by_route = {}
+        for item in (eta_all or []):
+            r = (item.get("RouteName") or {}).get("Zh_tw", "")
+            if r:
+                eta_by_route.setdefault(r, []).append(item)
+
+        with _realtime_lock:
+            if positions_all:
+                _realtime_cache["positions_by_route"] = positions_by_route
+            if eta_all:
+                _realtime_cache["eta_by_route"] = eta_by_route
+            if ok:
+                _realtime_cache["updated_at"] = now_str
+            _realtime_cache["last_attempt"] = now_str
+            _realtime_cache["last_attempt_ok"] = ok
+            snapshot_positions = dict(_realtime_cache["positions_by_route"])
+            snapshot_eta = dict(_realtime_cache["eta_by_route"])
+
+        _write_realtime_snapshot(snapshot_positions, snapshot_eta, ok, now_str)
+
+        try:
+            push_realtime_backup(REALTIME_DATA_DIR)
+        except Exception as e:
+            print(f"❌ 即時資料推送到 GitHub 失敗：{e}", flush=True)
+
+        print(f"{'✅' if ok else '⚠️'} 即時公車資料排程：定位 {len(positions_all or [])} 筆、"
+              f"到站預估 {len(eta_all or [])} 筆，時間 {now_str}", flush=True)
+    finally:
+        try:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fp.close()
 
 
 def _realtime_poll_loop():
