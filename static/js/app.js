@@ -247,7 +247,7 @@ async function handleHomeTile(action) {
       break;
     case 'nearby':
       el('yellow-bus-picker').classList.add('hidden');
-      showSubpage('subpage-route', 'nearby-anchor');
+      showSubpage('subpage-nearby', 'nearby-anchor');
       break;
     case 'chat':
       showSubpage('subpage-chat', 'chat-anchor');
