@@ -120,10 +120,14 @@ html, body { height: 100%; background: #f5f6fa; color: #222; }
 .warning-box { background: #fff6e0; color: #8a6100; padding: 8px 12px; border-radius: 6px; font-size: 13px; margin: 8px 0; }
 .error-box { background: #fde8e8; color: #a11; padding: 8px 12px; border-radius: 6px; font-size: 13px; margin: 8px 0; }
 
-.query-left select, .query-left input[type="text"] {
+.query-left select, .query-left input[type="text"],
+.query-nearby-section select, .query-nearby-section input[type="text"] {
   width: 100%; padding: 7px 10px; border-radius: 6px; border: 1px solid #ccd3e6; font-size: 13px; margin-bottom: 8px;
 }
-.query-left label { display: block; font-size: 13px; color: #444; margin: 8px 0 3px; font-weight: bold; }
+.query-left label, .query-nearby-section label { display: block; font-size: 13px; color: #444; margin: 8px 0 3px; font-weight: bold; }
+
+/* ── 附近公車站（獨立子頁）───────────────────────────── */
+.query-nearby-section { width: 100%; max-width: 380px; }
 
 #filter-route-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px; }
 .route-chip {
@@ -296,10 +300,10 @@ body.font-large .ev-tag, body.font-large .ubike-tag { font-size: 14px !important
 
   #app { flex-direction: column; }
 
-  /* 漢堡選單按鈕：固定於左上角 */
+  /* 漢堡選單按鈕：固定於右上角 */
   .mobile-menu-btn {
     display: flex; align-items: center; justify-content: center;
-    position: fixed; top: 10px; left: 10px; z-index: 1100;
+    position: fixed; top: 10px; right: 10px; z-index: 1100;
     width: 42px; height: 42px; border-radius: 8px;
     background: #16213e; color: #fff; border: none; font-size: 20px;
     cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.35);
@@ -333,6 +337,7 @@ body.font-large .ev-tag, body.font-large .ubike-tag { font-size: 14px !important
   /* 查詢頁：左右兩欄改為上下堆疊 */
   .query-columns { flex-direction: column; gap: 18px; }
   .query-left, .query-right { width: 100%; min-width: 0; }
+  .query-nearby-section { max-width: none; }
 
   .filter-grid { grid-template-columns: repeat(4, 1fr); gap: 6px; }
   .filter-btn { padding: 10px 0; font-size: 13px; }
@@ -453,10 +458,11 @@ body.theme-night .error-box { background: #3a1414; color: #ff9a9a; }
 body.theme-night #timetable-box { background: #171a24; border-color: #262a38; }
 body.theme-night .timetable-dir-title { color: #cfe0ff; }
 body.theme-night .timetable-time { background: #223055; color: #cfe0ff; }
-body.theme-night .query-left select, body.theme-night .query-left input[type="text"] {
+body.theme-night .query-left select, body.theme-night .query-left input[type="text"],
+body.theme-night .query-nearby-section select, body.theme-night .query-nearby-section input[type="text"] {
   background: #171a24; color: #eee; border-color: #2a3350;
 }
-body.theme-night .query-left label { color: #cfd8ff; }
+body.theme-night .query-left label, body.theme-night .query-nearby-section label { color: #cfd8ff; }
 body.theme-night #nearby-result .stop-item, body.theme-night #adv-search-result .route-item {
   border-color: #262a38;
 }
