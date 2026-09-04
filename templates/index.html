@@ -213,23 +213,6 @@
 
               <button id="btn-show-timetable" class="btn btn-block hidden">📅 查看固定時刻表</button>
               <div id="timetable-box" class="hidden"></div>
-
-              <hr>
-
-              <h3 id="nearby-anchor">📍 附近公車站</h3>
-              <button id="btn-gps" class="btn btn-block">📡 自動取得座標</button>
-              <div class="gps-coords">
-                緯度：<input id="lat-disp" readonly placeholder="點上方取得">
-              </div>
-              <div class="gps-coords">
-                經度：<input id="lon-disp" readonly placeholder="點上方取得">
-              </div>
-              <label>緯度</label>
-              <input type="text" id="gps-lat-in" placeholder="例：22.9997">
-              <label>經度</label>
-              <input type="text" id="gps-lon-in" placeholder="例：120.2270">
-              <button id="btn-search-nearby" class="btn btn-block">🔍 搜尋附近站牌</button>
-              <div id="nearby-result"></div>
             </div>
 
             <!-- 右欄：即時動態 -->
@@ -265,6 +248,26 @@
               <input type="text" id="chat-input" placeholder="有什麼我可以幫忙的嗎？">
               <button id="btn-chat-send" class="btn">送出</button>
             </div>
+          </div>
+        </div>
+
+        <!-- 子頁：附近公車站（獨立頁面，跟即時查詢頁分開） -->
+        <div id="subpage-nearby" class="subpage hidden">
+          <div class="query-nearby-section">
+            <h3 id="nearby-anchor">📍 附近公車站</h3>
+            <button id="btn-gps" class="btn btn-block">📡 自動取得座標</button>
+            <div class="gps-coords">
+              緯度：<input id="lat-disp" readonly placeholder="點上方取得">
+            </div>
+            <div class="gps-coords">
+              經度：<input id="lon-disp" readonly placeholder="點上方取得">
+            </div>
+            <label>緯度</label>
+            <input type="text" id="gps-lat-in" placeholder="例：22.9997">
+            <label>經度</label>
+            <input type="text" id="gps-lon-in" placeholder="例：120.2270">
+            <button id="btn-search-nearby" class="btn btn-block">🔍 搜尋附近站牌</button>
+            <div id="nearby-result"></div>
           </div>
         </div>
 
