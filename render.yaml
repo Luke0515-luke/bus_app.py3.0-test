@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: tainan-bus-assistant
+    name: bus_app.py3.0
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
