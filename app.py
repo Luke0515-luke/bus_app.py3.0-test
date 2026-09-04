@@ -18,16 +18,23 @@ except ImportError:
 
 from pull_backup import pull_backup
 from push_backup import git_push_backup
+from realtime_sync import pull_realtime_backup, push_realtime_backup
 import asyncio
 import threading
 import shutil
 
 load_dotenv()
 
+# 即時公車資料（定位／到站預估）快照的存放位置。跟路線 Shape/StopOfRoute 用的
+# /opt/render/project/data 是完全獨立的資料夾與獨立的 git 狀態（獨立分支），
+# 兩邊互不影響。
+REALTIME_DATA_DIR = "/opt/render/project/realtime"
+
 def create_app():
     import traceback
     traceback.print_stack()   # 印出是哪一行呼叫了 create_app
     pull_backup()
+    pull_realtime_backup(REALTIME_DATA_DIR)
     app = Flask(__name__)
     app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(24))
     return app
@@ -755,8 +762,9 @@ def fetch_route_stops_by_direction(route_name, direction):
     return []
 
 
-@cached(30)
-def fetch_bus_data(route_name):
+def _fetch_bus_data_from_tdx(route_name):
+    """實際向 TDX 查詢單一路線的到站預估時間（EstimatedTimeOfArrival）。
+    只給下面的後台排程呼叫，一般 API 請求改讀 fetch_bus_data() 的共用快照。"""
     url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/EstimatedTimeOfArrival/City/Tainan/{route_name}?%24format=JSON"
     try:
         res = requests.get(url, headers=tdx_headers(), timeout=10)
@@ -765,6 +773,39 @@ def fetch_bus_data(route_name):
     except Exception:
         pass
     return None
+
+
+def fetch_bus_data_all():
+    """一次性向 TDX 拿『全台南所有路線』的到站預估時間，只給後台排程呼叫，
+    取代原本每條路線各自查一次 TDX 的做法（跟 fetch_bus_realtime_positions()
+    不帶路線名稱時拿『全部公車定位』是同一種寫法）。"""
+    url = "https://tdx.transportdata.tw/api/basic/v2/Bus/EstimatedTimeOfArrival/City/Tainan?%24format=JSON"
+    try:
+        res = requests.get(url, headers=tdx_headers(), timeout=25)
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        pass
+    return None
+
+
+def fetch_bus_data(route_name):
+    """回傳某路線的到站預估時間。改成讀『後台排程每分鐘統一抓好』的共用快照，
+    不再由每一個使用者的請求各自打一次 TDX——這樣所有使用者看到的都是同一份、
+    由後台統一更新的資料，也大幅減少對 TDX 的查詢量。
+    只有在系統剛啟動、快照完全還是空的（例如第一次部署、還沒抓過任何資料）時，
+    才退回直接查一次 TDX，避免使用者看到完全空白的畫面。"""
+    with _realtime_lock:
+        by_route = _realtime_cache.get("eta_by_route") or {}
+        data = by_route.get(route_name)
+        has_data = bool(by_route)
+    if data is not None:
+        return data
+    if has_data:
+        # 快照有資料，但這條路線剛好沒有任何一筆（可能真的沒有車在跑），
+        # 回傳空清單維持跟舊版一樣的語意，而不是回傳 None（那會被上層當成查詢失敗）。
+        return []
+    return _fetch_bus_data_from_tdx(route_name)
 
 
 @cached(600)
@@ -882,7 +923,9 @@ def fetch_shapes_and_stops_parallel(routes):
     return shape_map, stop_map
 
 
-def fetch_bus_realtime_positions(route_name=None):
+def _fetch_bus_realtime_positions_from_tdx(route_name=None):
+    """實際向 TDX 查詢即時公車定位（RealTimeByFrequency）。
+    只給下面的後台排程呼叫，一般 API 請求改讀 fetch_bus_realtime_positions() 的共用快照。"""
     if route_name:
         url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/RealTimeByFrequency/City/Tainan/{route_name}?%24format=JSON"
     else:
@@ -894,6 +937,174 @@ def fetch_bus_realtime_positions(route_name=None):
     except Exception:
         pass
     return []
+
+
+def fetch_bus_realtime_positions(route_name=None):
+    """回傳即時公車 GPS 定位（不帶路線名稱＝全台南所有路線）。改成讀『後台排程
+    每分鐘統一抓好』的共用快照，不再由每一個使用者的請求各自打一次 TDX。
+    只有在系統剛啟動、快照完全還是空的時候，才退回直接查一次 TDX 當暫時的資料來源。"""
+    with _realtime_lock:
+        by_route = _realtime_cache.get("positions_by_route") or {}
+        has_data = bool(by_route)
+        if route_name:
+            result = list(by_route.get(route_name, []))
+        else:
+            result = [b for lst in by_route.values() for b in lst]
+    if has_data:
+        return result
+    return _fetch_bus_realtime_positions_from_tdx(route_name)
+
+
+# ── 即時公車資料（定位／到站預估）：後台每分鐘統一抓一次的共用快照 ─────────
+# 目的：所有使用者都讀同一份、由後台排程統一更新的資料，而不是每個人的每一次
+# 請求都各自向 TDX 發送請求；同時把這份快照存檔＋推到 GitHub 的獨立分支，
+# 即使 Render 重啟、換機器，也能立刻拿回上一次成功抓到的資料。
+REALTIME_POSITIONS_FILE = os.path.join(REALTIME_DATA_DIR, "positions.json")
+REALTIME_ETA_FILE = os.path.join(REALTIME_DATA_DIR, "eta.json")
+REALTIME_META_FILE = os.path.join(REALTIME_DATA_DIR, "meta.json")
+REALTIME_POLL_SECONDS = 60      # 每 1 分鐘抓一次
+REALTIME_STALE_SECONDS = 90     # 超過這個秒數還沒成功更新過，視為「尚未更新資料」
+
+_realtime_lock = threading.Lock()
+_realtime_cache = {
+    "positions_by_route": {},
+    "eta_by_route": {},
+    "updated_at": None,       # 最近一次「成功」更新的時間
+    "last_attempt": None,     # 最近一次「嘗試」更新的時間（不管成功與否）
+    "last_attempt_ok": None,
+}
+
+
+def get_realtime_status():
+    """回傳目前這份共用快照的新鮮度，給 API 附加在回應裡，讓前端可以在資料
+    太舊（代表後台排程可能連續失敗）時顯示「尚未更新資料」，而不是讓使用者
+    誤以為看到的一定是最新狀態。"""
+    with _realtime_lock:
+        updated_at = _realtime_cache.get("updated_at")
+    if not updated_at:
+        return {"updated_at": None, "is_fresh": False, "age_seconds": None}
+    try:
+        updated_dt = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return {"updated_at": updated_at, "is_fresh": False, "age_seconds": None}
+    age = (datetime.now() - updated_dt).total_seconds()
+    return {"updated_at": updated_at, "is_fresh": age <= REALTIME_STALE_SECONDS, "age_seconds": int(age)}
+
+
+def _load_realtime_cache_from_disk():
+    """伺服器剛啟動時，把上一次存檔（可能是這台機器自己存的，也可能是剛剛從
+    GitHub realtime-data 分支拉回來的）讀進記憶體，讓系統一開機就有資料可用，
+    不用整整等到第一次排程（最多 1 分鐘）跑完才有東西可以顯示。"""
+    positions_by_route, eta_by_route, meta = {}, {}, {}
+    try:
+        with open(REALTIME_POSITIONS_FILE, "r", encoding="utf-8") as f:
+            positions_by_route = json.load(f)
+    except Exception:
+        pass
+    try:
+        with open(REALTIME_ETA_FILE, "r", encoding="utf-8") as f:
+            eta_by_route = json.load(f)
+    except Exception:
+        pass
+    try:
+        with open(REALTIME_META_FILE, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception:
+        pass
+    with _realtime_lock:
+        _realtime_cache["positions_by_route"] = positions_by_route
+        _realtime_cache["eta_by_route"] = eta_by_route
+        _realtime_cache["updated_at"] = meta.get("updated_at")
+        _realtime_cache["last_attempt"] = meta.get("last_attempt")
+        _realtime_cache["last_attempt_ok"] = meta.get("last_attempt_ok")
+
+
+def _write_realtime_snapshot(positions_by_route, eta_by_route, ok, attempted_at):
+    """把這一輪抓到的定位／到站資料寫檔：每次都先刪掉舊檔，再整批寫入新的，
+    確保資料夾裡永遠只留『最新這一份』快照，而不是累加、保留歷史檔案。"""
+    try:
+        os.makedirs(REALTIME_DATA_DIR, exist_ok=True)
+        for path in (REALTIME_POSITIONS_FILE, REALTIME_ETA_FILE, REALTIME_META_FILE):
+            if os.path.exists(path):
+                os.remove(path)
+        with open(REALTIME_POSITIONS_FILE, "w", encoding="utf-8") as f:
+            json.dump(positions_by_route, f, ensure_ascii=False)
+        with open(REALTIME_ETA_FILE, "w", encoding="utf-8") as f:
+            json.dump(eta_by_route, f, ensure_ascii=False)
+        with open(REALTIME_META_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "updated_at": _realtime_cache.get("updated_at"),
+                "last_attempt": attempted_at,
+                "last_attempt_ok": ok,
+            }, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ 寫入即時資料快照失敗：{e}", flush=True)
+
+
+def _realtime_poll_once():
+    """後台排程主體：每分鐘執行一次，統一向 TDX 抓『全台南公車即時定位』與
+    『全台南到站預估時間』各一次（各只發一次請求，不是每條路線各發一次），
+    取代原本每個使用者查詢時都各自打一次 TDX 的做法。
+    抓到之後：① 依路線名稱分組、更新記憶體共用快取 ② 存檔（先清舊檔再整批換新）
+    ③ 推送到 bus_app.py3.0backup 這個 repo 的 realtime-data 分支。
+    只要這一輪完全沒抓到任何資料，就不更新 updated_at，讓 get_realtime_status()
+    能正確判斷『已經有一段時間沒有成功更新』，回傳給前端顯示「尚未更新資料」。"""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    positions_all = _fetch_bus_realtime_positions_from_tdx(None)
+    eta_all = fetch_bus_data_all()
+    ok = bool(positions_all) or bool(eta_all)
+
+    positions_by_route = {}
+    for b in (positions_all or []):
+        r = (b.get("RouteName") or {}).get("Zh_tw", "")
+        if r:
+            positions_by_route.setdefault(r, []).append(b)
+
+    eta_by_route = {}
+    for item in (eta_all or []):
+        r = (item.get("RouteName") or {}).get("Zh_tw", "")
+        if r:
+            eta_by_route.setdefault(r, []).append(item)
+
+    with _realtime_lock:
+        if positions_all:
+            _realtime_cache["positions_by_route"] = positions_by_route
+        if eta_all:
+            _realtime_cache["eta_by_route"] = eta_by_route
+        if ok:
+            _realtime_cache["updated_at"] = now_str
+        _realtime_cache["last_attempt"] = now_str
+        _realtime_cache["last_attempt_ok"] = ok
+        snapshot_positions = dict(_realtime_cache["positions_by_route"])
+        snapshot_eta = dict(_realtime_cache["eta_by_route"])
+
+    _write_realtime_snapshot(snapshot_positions, snapshot_eta, ok, now_str)
+
+    try:
+        push_realtime_backup(REALTIME_DATA_DIR)
+    except Exception as e:
+        print(f"❌ 即時資料推送到 GitHub 失敗：{e}", flush=True)
+
+    print(f"{'✅' if ok else '⚠️'} 即時公車資料排程：定位 {len(positions_all or [])} 筆、"
+          f"到站預估 {len(eta_all or [])} 筆，時間 {now_str}", flush=True)
+
+
+def _realtime_poll_loop():
+    """每 REALTIME_POLL_SECONDS（1 分鐘）跑一次 _realtime_poll_once()，
+    跟現有備份路線資料用的 backup_loop／scheduler_thread 是各自獨立的排程執行緒，
+    互不影響。"""
+    while True:
+        try:
+            _realtime_poll_once()
+        except Exception as e:
+            print(f"❌ 即時資料排程發生例外：{e}", flush=True)
+        time.sleep(REALTIME_POLL_SECONDS)
+
+
+_load_realtime_cache_from_disk()
+realtime_thread = threading.Thread(target=_realtime_poll_loop, daemon=True)
+realtime_thread.start()
 
 
 def find_nearby_stops(all_stops, lat, lon, radius_km=0.5):
@@ -1494,6 +1705,7 @@ def api_route_status():
     )
     state["bus_status"] = bus_status
 
+    realtime_status = get_realtime_status()
     return jsonify({
         "dest0": dest_0, "dest1": dest_1,
         "weather": weather_info,
@@ -1502,6 +1714,9 @@ def api_route_status():
         "tts_text": "".join(tts_lines),
         "active_bus_count": active_bus_count,
         "empty": False,
+        "data_fresh": realtime_status["is_fresh"],
+        "data_updated_at": realtime_status["updated_at"],
+        "data_age_seconds": realtime_status["age_seconds"],
     })
 
 
@@ -1700,6 +1915,7 @@ def api_map_data():
                 "lat": sp["lat"], "lon": sp["lon"], "color": color
             })
 
+    realtime_status = get_realtime_status()
     return jsonify({
         "buses": bus_features,
         "shapes": shape_features,
@@ -1708,6 +1924,9 @@ def api_map_data():
         "saved_routes": sorted(get_saved_route_names()),
         "live_routes": sorted(live_route_set),
         "now": datetime.now().strftime("%H:%M:%S"),
+        "data_fresh": realtime_status["is_fresh"],
+        "data_updated_at": realtime_status["updated_at"],
+        "data_age_seconds": realtime_status["age_seconds"],
     })
 
 
