@@ -11,6 +11,28 @@ from flask import Flask, render_template, request, jsonify, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 
+# ── 對外 HTTP 連線：共用一個 requests.Session + 連線池 ──────────
+# 原本每次 requests.get/post 都會重新建立一條 TCP/TLS 連線，人多的時候（TDX、
+# OSRM、UBike 等外部 API）建立連線本身的開銷會被放大很多倍。改用共用的
+# Session＋連線池後，同一台伺服器對同一個外部主機的連線可以重複使用，
+# 對外部 API 的請求延遲跟本機的檔案／連線數消耗都會明顯下降。
+_http_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=100, pool_maxsize=100, max_retries=1
+)
+SESSION = requests.Session()
+SESSION.mount("https://", _http_adapter)
+SESSION.mount("http://", _http_adapter)
+requests.get = SESSION.get
+requests.post = SESSION.post
+
+# ── 共用的執行緒池 ──────────────────────────────────────────
+# 原本好幾個地方（地圖資料、進階查詢、備援到站查詢…）都是每次呼叫就臨時
+# `with ThreadPoolExecutor(...) as ex:` 開一個新的執行緒池、用完就丟掉。
+# 平常沒事沒差，但人多的時候（例如 1000 人同時打開地圖頁）等於同時憑空
+# 生出成千上萬條執行緒，光是建立/銷毀執行緒本身就很傷效能。改成整支程式
+# 共用同一個執行緒池，執行緒數固定上限（不會無限長大），大家排隊共用即可。
+EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=40, thread_name_prefix="io")
+
 try:
     from groq import Groq
 except ImportError:
@@ -32,14 +54,31 @@ load_dotenv()
 REALTIME_DATA_DIR = "/opt/render/project/realtime"
 
 def create_app():
-    import traceback
-    traceback.print_stack()   # 印出是哪一行呼叫了 create_app
     pull_backup()
     pull_realtime_backup(REALTIME_DATA_DIR)
     app = Flask(__name__)
     app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(24))
+    if not os.environ.get("FLASK_SECRET_KEY"):
+        print("⚠️ 沒有設定 FLASK_SECRET_KEY 環境變數：每次重啟伺服器，"
+              "所有人的登入狀態／匿名 session 都會失效。正式站請到 Render 的"
+              "環境變數設定一組固定的 FLASK_SECRET_KEY。", flush=True)
+    # 靜態檔案（CSS/JS）預設快取 1 小時，減少人多時重複下載同一份檔案的頻寬與請求數；
+    # 改版後若要立刻讓使用者拿到新檔案，把 <script>/<link> 的網址加上 ?v=版本號 即可。
+    app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 3600
     return app
 app = create_app()
+
+# ── 回應壓縮（gzip）──────────────────────────────────────────
+# 路線軌跡（Shape）、站牌清單這類 JSON 常常一次好幾百 KB，開 gzip 壓縮後
+# 傳輸量通常可以砍到只剩 1~2 成，人多、頻寬吃緊時效果最明顯。這裡刻意用
+# try/except 包起來：如果伺服器還沒安裝 flask-compress（requirements.txt
+# 還沒加），不會讓整個網站掛掉，只是先跳過壓縮，等套件裝好會自動生效。
+try:
+    from flask_compress import Compress
+    Compress(app)
+except ImportError:
+    print("ℹ️ 尚未安裝 flask-compress，回應不會壓縮。"
+          "建議在 requirements.txt 加入 flask-compress 以節省流量。", flush=True)
 
 # ── 環境變數 / 認證資訊 ───────────────────────────────────
 app_id = os.environ.get("CLIENT_ID")
@@ -502,6 +541,7 @@ async def backup_loop():
     """每 3 小時執行備份的非同步迴圈"""
     while True:
         await backup()
+        cleanup_stale_sessions()
         await asyncio.sleep(10 * 60)
 
 def run_scheduler():
@@ -557,18 +597,41 @@ def get_all_known_routes():
 
 # ── in-memory 快取（等同於 st.cache_data）────────────────
 _cache_store = {}
+_cache_locks_guard = threading.Lock()
+_cache_key_locks = {}
+
+
+def _lock_for_key(key):
+    # 每個快取 key 各自一把鎖，只在真的要重新計算時才鎖住『那一個 key』，
+    # 不會卡住其他不相關的查詢；用一把很小的 guard 鎖來保護「拿鎖」這個動作本身。
+    with _cache_locks_guard:
+        lock = _cache_key_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _cache_key_locks[key] = lock
+        return lock
 
 
 def cached(ttl_seconds):
+    """人多的時候，同一個還沒被快取過的 key（例如剛好在快取到期那一瞬間）
+    可能會被上百個請求同時打進來，若沒有鎖，每個請求都會各自重複呼叫一次
+    很貴的外部 API（TDX / OSRM），也就是「thundering herd」。這裡改成：
+    第一個發現快取過期的請求會拿到鎖去真的重新查詢，其他同時進來的請求
+    會在鎖外面等一下，查完後直接共用同一份剛算好的結果，不會重複打好幾次。"""
     def decorator(func):
         def wrapper(*args, **kwargs):
             key = f"{func.__name__}:{args}:{kwargs}"
             hit = _cache_store.get(key)
             if hit and time.time() - hit["time"] < ttl_seconds:
                 return hit["data"]
-            result = func(*args, **kwargs)
-            _cache_store[key] = {"time": time.time(), "data": result}
-            return result
+            with _lock_for_key(key):
+                # 拿到鎖之後再檢查一次：可能剛剛等鎖的時候，別的執行緒已經算好了
+                hit = _cache_store.get(key)
+                if hit and time.time() - hit["time"] < ttl_seconds:
+                    return hit["data"]
+                result = func(*args, **kwargs)
+                _cache_store[key] = {"time": time.time(), "data": result}
+                return result
         wrapper.__name__ = func.__name__
         return wrapper
     return decorator
@@ -587,6 +650,7 @@ def _default_state():
         "current_session_id": None,
         "current_weather": "尚未查詢",
         "bus_status": "尚未查詢路線",
+        "_last_seen": time.time(),
     }
 
 
@@ -602,11 +666,27 @@ def get_uid():
         uid = session["uid"]
     if uid not in SESSION_STORE:
         SESSION_STORE[uid] = _default_state()
+    SESSION_STORE[uid]["_last_seen"] = time.time()
     return uid
 
 
 def get_state():
     return SESSION_STORE[get_uid()]
+
+
+def cleanup_stale_sessions(max_idle_hours=12):
+    """人多的時候，每個沒登入的訪客都會各自佔一筆匿名 SESSION_STORE 記錄，
+    瀏覽器分頁一關掉就再也不會回來用了，但記憶體不會自己釋放——長時間下來
+    等於是慢性的記憶體洩漏，流量大時特別容易把伺服器記憶體榨乾。這裡只清
+    『沒登入的匿名訪客』，且超過 max_idle_hours 沒有任何動作才清掉；已登入
+    帳號（key 開頭是 "user:"）一律保留，不受影響。"""
+    cutoff = time.time() - max_idle_hours * 3600
+    stale = [uid for uid, st in list(SESSION_STORE.items())
+             if not uid.startswith("user:") and st.get("_last_seen", 0) < cutoff]
+    for uid in stale:
+        SESSION_STORE.pop(uid, None)
+    if stale:
+        print(f"🧹 已清除 {len(stale)} 筆閒置超過 {max_idle_hours} 小時的匿名 session（釋放記憶體）", flush=True)
 
 
 def _login_user(username):
@@ -800,16 +880,15 @@ def _fetch_eta_by_route_parallel(routes):
     result = {}
     if not routes:
         return result
-    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
-        future_to_route = {ex.submit(_fetch_bus_data_from_tdx, r): r for r in routes}
-        for future in concurrent.futures.as_completed(future_to_route):
-            r = future_to_route[future]
-            try:
-                data = future.result()
-            except Exception:
-                data = None
-            if data:
-                result[r] = data
+    futures = {EXECUTOR.submit(_fetch_bus_data_from_tdx, r): r for r in routes}
+    for future in concurrent.futures.as_completed(futures):
+        r = futures[future]
+        try:
+            data = future.result()
+        except Exception:
+            data = None
+        if data:
+            result[r] = data
     return result
 
 
@@ -936,15 +1015,14 @@ def fetch_shapes_and_stops_parallel(routes):
     def worker(r):
         return r, fetch_route_shape(r), fetch_route_stop_positions(r)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(worker, r) for r in routes]
-        for fut in concurrent.futures.as_completed(futures):
-            try:
-                r, shapes, stops = fut.result()
-                shape_map[r] = shapes
-                stop_map[r] = stops
-            except Exception:
-                pass
+    futures = [EXECUTOR.submit(worker, r) for r in routes]
+    for fut in concurrent.futures.as_completed(futures):
+        try:
+            r, shapes, stops = fut.result()
+            shape_map[r] = shapes
+            stop_map[r] = stops
+        except Exception:
+            pass
     return shape_map, stop_map
 
 
@@ -1240,14 +1318,13 @@ def _fetch_all_route_stops_parallel(routes):
     """平行為多條路線取得站名清單。內部走 fetch_route_stops，
     每條路線都會優先讀 data/route 裡的存檔，沒有才即時查並自動存檔。"""
     result = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_route_stops, r): r for r in routes}
-        for fut in concurrent.futures.as_completed(futures):
-            r = futures[fut]
-            try:
-                result[r] = fut.result()
-            except Exception:
-                result[r] = []
+    futures = {EXECUTOR.submit(fetch_route_stops, r): r for r in routes}
+    for fut in concurrent.futures.as_completed(futures):
+        r = futures[fut]
+        try:
+            result[r] = fut.result()
+        except Exception:
+            result[r] = []
     return result
 
 
@@ -2219,14 +2296,13 @@ def api_update_cache():
     一般情況下不需要手動按這顆按鈕——每條路線第一次被查詢或在地圖上顯示時，
     就會自動存檔；這顆按鈕只是用來一次性強制刷新全部路線的最新資料。"""
     count = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(_fetch_and_save_stop_data, r): r for r in get_all_known_routes()}
-        for fut in concurrent.futures.as_completed(futures):
-            try:
-                if fut.result():
-                    count += 1
-            except Exception:
-                pass
+    futures = {EXECUTOR.submit(_fetch_and_save_stop_data, r): r for r in get_all_known_routes()}
+    for fut in concurrent.futures.as_completed(futures):
+        try:
+            if fut.result():
+                count += 1
+        except Exception:
+            pass
     # 清除相關記憶體快取，讓下一次查詢立即反映新資料
     _cache_store.clear()
     return jsonify({"status": "success", "count": count})
@@ -2352,4 +2428,18 @@ def api_chat():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    # 這只是本機開發用的啟動方式：debug=True 的重載器（reloader）會多開一個
+    # 子行程，等於把上面 scheduler_thread／realtime_thread 都各自重複跑兩份
+    # （重複備份、重複打 TDX），本機測試沒關係，但正式站絕對不要用這行來跑。
+    # 正式環境（Render）請用 gunicorn 啟動，例如 start.sh 裡放：
+    #   gunicorn -w 1 --threads 24 --worker-class gthread --timeout 60 -b 0.0.0.0:$PORT app:app
+    # 只開 1 個 worker（process）是刻意的：這支程式的登入狀態、最愛路線、
+    # 即時公車快取（SESSION_STORE / _cache_store / _realtime_cache）都存在
+    # 記憶體裡，如果開多個 worker process，每個 process 會各自擁有一份互不
+    # 相通的記憶體，使用者可能這次連到 A、下次連到 B，找不到自己剛存的資料，
+    # 背景排程（備份、抓即時公車）也會被重複啟動好幾份。用「1 個 process、
+    # 多條 thread」則可以在維持同一份記憶體狀態的前提下，同時應付大量使用者
+    # ——因為這支程式大部分時間都在等外部 API（TDX／OSRM）回應，thread 在等待
+    # 網路 I/O 時會釋放 GIL，讓其他 thread 可以繼續處理別的請求，一千人同時
+    # 上線大多也只是同時在「等」，並不會真的一千個人同時佔用 CPU。
+    app.run(debug=False, threaded=True, port=int(os.environ.get("PORT", 5000)))
