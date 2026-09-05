@@ -44,6 +44,8 @@ const state = {
   reminders: [],
   reminderAlertedIds: new Set(),
   reminderPollTimer: null,
+  routeStatusPollTimer: null,
+  mapPollTimer: null,
   busListOpen: true,
   leafletMap: null,
   busLayer: null,
@@ -221,6 +223,37 @@ function showHome() {
   el('subpage-container').classList.add('hidden');
   document.querySelectorAll('.subpage').forEach(s => s.classList.add('hidden'));
   el('yellow-bus-picker').classList.add('hidden');
+  stopRouteStatusAutoRefresh();
+}
+
+// 公車即時定位／到站動態現在改成後台每分鐘統一向 TDX 抓一次、存進檔案，
+// 所有使用者的查詢都直接讀這份檔案（見後端 fetch_bus_data／
+// fetch_bus_realtime_positions），所以前端可以放心地每 15 秒自動重新整理一次
+// 畫面，不會因此增加對 TDX 的查詢量——15 秒只是「更常去讀後台已經準備好的
+// 那份檔案」，不是「更常去問 TDX」。
+const AUTO_REFRESH_MS = 15000;
+
+function startRouteStatusAutoRefresh() {
+  stopRouteStatusAutoRefresh();
+  state.routeStatusPollTimer = setInterval(() => {
+    if (state.routeChoice) loadRouteStatus();
+  }, AUTO_REFRESH_MS);
+}
+function stopRouteStatusAutoRefresh() {
+  if (state.routeStatusPollTimer) {
+    clearInterval(state.routeStatusPollTimer);
+    state.routeStatusPollTimer = null;
+  }
+}
+function startMapAutoRefresh() {
+  stopMapAutoRefresh();
+  state.mapPollTimer = setInterval(() => loadMapData(), AUTO_REFRESH_MS);
+}
+function stopMapAutoRefresh() {
+  if (state.mapPollTimer) {
+    clearInterval(state.mapPollTimer);
+    state.mapPollTimer = null;
+  }
 }
 
 function showSubpage(id, anchorId) {
@@ -244,18 +277,22 @@ async function handleHomeTile(action) {
     case 'filter':
       el('yellow-bus-picker').classList.add('hidden');
       showSubpage('subpage-route', 'filter-anchor');
+      startRouteStatusAutoRefresh();
       break;
     case 'nearby':
       el('yellow-bus-picker').classList.add('hidden');
       showSubpage('subpage-nearby', 'nearby-anchor');
+      stopRouteStatusAutoRefresh();
       break;
     case 'chat':
       showSubpage('subpage-chat', 'chat-anchor');
+      stopRouteStatusAutoRefresh();
       break;
     case 'yellow-bus':
       showSubpage('subpage-route', 'yellow-bus-anchor');
       el('yellow-bus-picker').classList.remove('hidden');
       loadYellowBusRoutes();
+      stopRouteStatusAutoRefresh();
       break;
     case 'favorites':
       openSidebar();
@@ -331,7 +368,12 @@ function switchPage(page) {
   el('page-map').classList.toggle('hidden', page !== 'map');
   el('btn-page-toggle').textContent = page === 'map' ? '🚌 回到查詢頁面' : '🗺️ 公車即時地圖';
   document.body.classList.remove('sidebar-open');
-  if (page === 'map') initMapPageIfNeeded();
+  if (page === 'map') {
+    initMapPageIfNeeded();
+    startMapAutoRefresh();
+  } else {
+    stopMapAutoRefresh();
+  }
 }
 
 // ── 路線篩選 / 選擇 ───────────────────────────────────────
@@ -409,6 +451,7 @@ async function onRouteSelect() {
   el('reminder-add-box').classList.remove('hidden');
 
   await loadRouteStatus();
+  startRouteStatusAutoRefresh();
 }
 
 function refreshFavToggleLabel() {
@@ -474,6 +517,7 @@ async function loadRouteStatus() {
   el('status-empty').classList.add('hidden');
   el('weather-box').textContent = `🌡️ 台南目前天氣：${data.weather}`;
   el('weather-box').classList.remove('hidden');
+  el('realtime-stale-hint').classList.toggle('hidden', data.data_fresh !== false);
 
   state.destNames = { 去程: data.dest0, 回程: data.dest1 };
   const busCountText = typeof data.active_bus_count === 'number'
@@ -1147,7 +1191,8 @@ async function loadMapData(forceRefresh) {
     state.mapStopData = data.stops || [];
     state.savedRoutes = data.saved_routes || [];
     state.mapActiveRoutes = new Set(data.routes); // 這次實際抓到、畫出來的路線
-    el('map-caption').textContent = `資料時間：${data.now}　｜　每次按「🔄 更新」重抓最新位置`;
+    const staleNote = data.data_fresh === false ? '　｜　⚠️ 尚未更新資料' : '';
+    el('map-caption').textContent = `資料時間：${data.now}　｜　每次按「🔄 更新」重抓最新位置${staleNote}`;
     drawMapShapes();
     drawMapStops();
     drawMapBuses();
