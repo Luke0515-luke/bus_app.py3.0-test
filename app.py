@@ -7,31 +7,9 @@ import concurrent.futures
 from datetime import datetime, timedelta
 
 import requests
-from flask import Flask, render_template, request, jsonify, session, url_for
+from flask import Flask, render_template, request, jsonify, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
-
-# ── 對外 HTTP 連線：共用一個 requests.Session + 連線池 ──────────
-# 原本每次 requests.get/post 都會重新建立一條 TCP/TLS 連線，人多的時候（TDX、
-# OSRM、UBike 等外部 API）建立連線本身的開銷會被放大很多倍。改用共用的
-# Session＋連線池後，同一台伺服器對同一個外部主機的連線可以重複使用，
-# 對外部 API 的請求延遲跟本機的檔案／連線數消耗都會明顯下降。
-_http_adapter = requests.adapters.HTTPAdapter(
-    pool_connections=100, pool_maxsize=100, max_retries=1
-)
-SESSION = requests.Session()
-SESSION.mount("https://", _http_adapter)
-SESSION.mount("http://", _http_adapter)
-requests.get = SESSION.get
-requests.post = SESSION.post
-
-# ── 共用的執行緒池 ──────────────────────────────────────────
-# 原本好幾個地方（地圖資料、進階查詢、備援到站查詢…）都是每次呼叫就臨時
-# `with ThreadPoolExecutor(...) as ex:` 開一個新的執行緒池、用完就丟掉。
-# 平常沒事沒差，但人多的時候（例如 1000 人同時打開地圖頁）等於同時憑空
-# 生出成千上萬條執行緒，光是建立/銷毀執行緒本身就很傷效能。改成整支程式
-# 共用同一個執行緒池，執行緒數固定上限（不會無限長大），大家排隊共用即可。
-EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=40, thread_name_prefix="io")
 
 try:
     from groq import Groq
@@ -40,11 +18,7 @@ except ImportError:
 
 from pull_backup import pull_backup
 from push_backup import git_push_backup
-from realtime_sync import (
-    pull_realtime_backup,
-    push_realtime_backup,
-    start_realtime_watchdog
-)
+from realtime_sync import pull_realtime_backup, push_realtime_backup
 import asyncio
 import threading
 import shutil
@@ -58,48 +32,14 @@ load_dotenv()
 REALTIME_DATA_DIR = "/opt/render/project/realtime"
 
 def create_app():
+    import traceback
+    traceback.print_stack()   # 印出是哪一行呼叫了 create_app
     pull_backup()
     pull_realtime_backup(REALTIME_DATA_DIR)
     app = Flask(__name__)
     app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(24))
-    if not os.environ.get("FLASK_SECRET_KEY"):
-        print("⚠️ 沒有設定 FLASK_SECRET_KEY 環境變數：每次重啟伺服器，"
-              "所有人的登入狀態／匿名 session 都會失效。正式站請到 Render 的"
-              "環境變數設定一組固定的 FLASK_SECRET_KEY。", flush=True)
-    # 靜態檔案（CSS/JS）預設快取 1 小時，減少人多時重複下載同一份檔案的頻寬與請求數；
-    # 改版後若要立刻讓使用者拿到新檔案，把 <script>/<link> 的網址加上 ?v=版本號 即可。
-    app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 3600
     return app
 app = create_app()
-
-
-@app.template_global()
-def static_url(filename):
-    """比照 {{ url_for('static', filename=...) }}，但網址後面多帶一個 ?v=檔案的
-    最後修改時間。前面為了效能把靜態檔案（CSS/JS）設定成瀏覽器快取 1 小時
-    （SEND_FILE_MAX_AGE_DEFAULT），這其實是這幾次『明明改了程式碼、畫面卻看
-    起來沒變』的真正原因——瀏覽器還在用快取裡那份 1 小時內的舊檔案，不是
-    程式碼沒改到。改用這個函式產生網址後，只要檔案內容一變，?v= 後面的數字
-    就會跟著變，等於是新的網址，瀏覽器會直接抓新檔案，不用再手動清快取，
-    也不用犧牲掉長效快取帶來的效能好處。"""
-    fp = os.path.join(app.static_folder or "static", filename)
-    try:
-        v = int(os.path.getmtime(fp))
-    except OSError:
-        v = 0
-    return f"{url_for('static', filename=filename)}?v={v}"
-
-# ── 回應壓縮（gzip）──────────────────────────────────────────
-# 路線軌跡（Shape）、站牌清單這類 JSON 常常一次好幾百 KB，開 gzip 壓縮後
-# 傳輸量通常可以砍到只剩 1~2 成，人多、頻寬吃緊時效果最明顯。這裡刻意用
-# try/except 包起來：如果伺服器還沒安裝 flask-compress（requirements.txt
-# 還沒加），不會讓整個網站掛掉，只是先跳過壓縮，等套件裝好會自動生效。
-try:
-    from flask_compress import Compress
-    Compress(app)
-except ImportError:
-    print("ℹ️ 尚未安裝 flask-compress，回應不會壓縮。"
-          "建議在 requirements.txt 加入 flask-compress 以節省流量。", flush=True)
 
 # ── 環境變數 / 認證資訊 ───────────────────────────────────
 app_id = os.environ.get("CLIENT_ID")
@@ -562,7 +502,6 @@ async def backup_loop():
     """每 3 小時執行備份的非同步迴圈"""
     while True:
         await backup()
-        cleanup_stale_sessions()
         await asyncio.sleep(10 * 60)
 
 def run_scheduler():
@@ -618,41 +557,18 @@ def get_all_known_routes():
 
 # ── in-memory 快取（等同於 st.cache_data）────────────────
 _cache_store = {}
-_cache_locks_guard = threading.Lock()
-_cache_key_locks = {}
-
-
-def _lock_for_key(key):
-    # 每個快取 key 各自一把鎖，只在真的要重新計算時才鎖住『那一個 key』，
-    # 不會卡住其他不相關的查詢；用一把很小的 guard 鎖來保護「拿鎖」這個動作本身。
-    with _cache_locks_guard:
-        lock = _cache_key_locks.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _cache_key_locks[key] = lock
-        return lock
 
 
 def cached(ttl_seconds):
-    """人多的時候，同一個還沒被快取過的 key（例如剛好在快取到期那一瞬間）
-    可能會被上百個請求同時打進來，若沒有鎖，每個請求都會各自重複呼叫一次
-    很貴的外部 API（TDX / OSRM），也就是「thundering herd」。這裡改成：
-    第一個發現快取過期的請求會拿到鎖去真的重新查詢，其他同時進來的請求
-    會在鎖外面等一下，查完後直接共用同一份剛算好的結果，不會重複打好幾次。"""
     def decorator(func):
         def wrapper(*args, **kwargs):
             key = f"{func.__name__}:{args}:{kwargs}"
             hit = _cache_store.get(key)
             if hit and time.time() - hit["time"] < ttl_seconds:
                 return hit["data"]
-            with _lock_for_key(key):
-                # 拿到鎖之後再檢查一次：可能剛剛等鎖的時候，別的執行緒已經算好了
-                hit = _cache_store.get(key)
-                if hit and time.time() - hit["time"] < ttl_seconds:
-                    return hit["data"]
-                result = func(*args, **kwargs)
-                _cache_store[key] = {"time": time.time(), "data": result}
-                return result
+            result = func(*args, **kwargs)
+            _cache_store[key] = {"time": time.time(), "data": result}
+            return result
         wrapper.__name__ = func.__name__
         return wrapper
     return decorator
@@ -671,7 +587,6 @@ def _default_state():
         "current_session_id": None,
         "current_weather": "尚未查詢",
         "bus_status": "尚未查詢路線",
-        "_last_seen": time.time(),
     }
 
 
@@ -687,27 +602,11 @@ def get_uid():
         uid = session["uid"]
     if uid not in SESSION_STORE:
         SESSION_STORE[uid] = _default_state()
-    SESSION_STORE[uid]["_last_seen"] = time.time()
     return uid
 
 
 def get_state():
     return SESSION_STORE[get_uid()]
-
-
-def cleanup_stale_sessions(max_idle_hours=12):
-    """人多的時候，每個沒登入的訪客都會各自佔一筆匿名 SESSION_STORE 記錄，
-    瀏覽器分頁一關掉就再也不會回來用了，但記憶體不會自己釋放——長時間下來
-    等於是慢性的記憶體洩漏，流量大時特別容易把伺服器記憶體榨乾。這裡只清
-    『沒登入的匿名訪客』，且超過 max_idle_hours 沒有任何動作才清掉；已登入
-    帳號（key 開頭是 "user:"）一律保留，不受影響。"""
-    cutoff = time.time() - max_idle_hours * 3600
-    stale = [uid for uid, st in list(SESSION_STORE.items())
-             if not uid.startswith("user:") and st.get("_last_seen", 0) < cutoff]
-    for uid in stale:
-        SESSION_STORE.pop(uid, None)
-    if stale:
-        print(f"🧹 已清除 {len(stale)} 筆閒置超過 {max_idle_hours} 小時的匿名 session（釋放記憶體）", flush=True)
 
 
 def _login_user(username):
@@ -866,14 +765,18 @@ def fetch_route_stops_by_direction(route_name, direction):
 
 def _fetch_bus_data_from_tdx(route_name):
     """實際向 TDX 查詢單一路線的到站預估時間（EstimatedTimeOfArrival）。
-    只給下面的後台排程呼叫，一般 API 請求改讀 fetch_bus_data() 的共用快照。"""
+    只給下面的後台排程呼叫，一般 API 請求改讀 fetch_bus_data() 的共用快照。
+    改用 tdx_get()（內建重試一次），單一路線偶發逾時／限流時不會直接放棄，
+    這樣『很多站的時間都是從時刻表推的』這個狀況會少很多——那通常就是因為
+    這支查詢那一輪剛好失敗，導致這條路線完全沒有即時資料可用，才會整條路線
+    都退回時刻表估計。"""
     url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/EstimatedTimeOfArrival/City/Tainan/{route_name}?%24format=JSON"
-    try:
-        res = requests.get(url, headers=tdx_headers(), timeout=10)
-        if res.status_code == 200:
+    res = tdx_get(url, timeout=8, retries=1)
+    if res is not None:
+        try:
             return res.json()
-    except Exception:
-        pass
+        except Exception:
+            pass
     return None
 
 
@@ -882,12 +785,12 @@ def fetch_bus_data_all():
     取代原本每條路線各自查一次 TDX 的做法（跟 fetch_bus_realtime_positions()
     不帶路線名稱時拿『全部公車定位』是同一種寫法）。"""
     url = "https://tdx.transportdata.tw/api/basic/v2/Bus/EstimatedTimeOfArrival/City/Tainan?%24format=JSON"
-    try:
-        res = requests.get(url, headers=tdx_headers(), timeout=25)
-        if res.status_code == 200:
+    res = tdx_get(url, timeout=25, retries=0)
+    if res is not None:
+        try:
             return res.json()
-    except Exception:
-        pass
+        except Exception:
+            pass
     return None
 
 
@@ -896,33 +799,57 @@ def _fetch_eta_by_route_parallel(routes):
     沒有拿到任何資料（有可能 TDX 這個 API 其實不支援這種一次查全部路線的寫法），
     改成逐條路線平行查詢當備援——用執行緒池同時查，不是一條一條依序等，
     確保到站資訊還是查得到，不會因為城市級 API 不支援就整個開天窗。
+    max_workers 開比較大（40）：每一條路線的查詢都帶了重試（見
+    _fetch_bus_data_from_tdx），單一請求最壞情況可能要等 15 秒以上，
+    如果平行數開太小，路線一多（台南有 80~90 條左右），加總下來很容易
+    超過後台排程 60 秒一輪的預算，反而讓『這一輪』整個拖過頭。
     回傳 {路線名稱: [到站資訊項目, ...]}，key 直接用查詢時的路線名稱，
     不依賴回傳資料裡有沒有正確的 RouteName 欄位。"""
     result = {}
+    failed_routes = []
     if not routes:
         return result
-    futures = {EXECUTOR.submit(_fetch_bus_data_from_tdx, r): r for r in routes}
-    for future in concurrent.futures.as_completed(futures):
-        r = futures[future]
-        try:
-            data = future.result()
-        except Exception:
-            data = None
-        if data:
-            result[r] = data
+    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as ex:
+        future_to_route = {ex.submit(_fetch_bus_data_from_tdx, r): r for r in routes}
+        for future in concurrent.futures.as_completed(future_to_route):
+            r = future_to_route[future]
+            try:
+                data = future.result()
+            except Exception:
+                data = None
+            # 特別注意 data 是 None（這次真的查詢失敗）跟 data 是 []（查詢成功，
+            # 只是這條路線目前剛好沒有任何到站預估，例如末班車已過）的差別：
+            # 只有前者才算「失敗」，需要在外層保留上一輪的舊資料；
+            # 後者是真的、最新的狀態，就應該讓它覆蓋過去，不能被當成失敗而略過。
+            if data is not None:
+                result[r] = data
+            else:
+                failed_routes.append(r)
+    if failed_routes:
+        print(f"⚠️ 這一輪到站預估查詢失敗的路線（{len(failed_routes)} 條，"
+              f"這幾條這一輪會沿用上一輪的資料，查不到才會退回時刻表估計）："
+              f"{'、'.join(failed_routes[:15])}{'…' if len(failed_routes) > 15 else ''}", flush=True)
     return result
 
 
 def fetch_bus_data(route_name):
-    """回傳某路線的到站預估時間。一律讀『後台排程統一抓好』的共用快照，
-    不再由每一個使用者的請求各自打一次 TDX——包含系統剛啟動、快照還是空的
-    第一次查詢也一樣，只會拿到空清單，不會退回去直接查 TDX。這樣所有使用者
-    看到的都是同一份、由後台統一更新的資料，也不會有『剛好卡在第一次』的
-    請求要獨自承擔一次直接查 TDX 的延遲。"""
+    """回傳某路線的到站預估時間。改成讀『後台排程每分鐘統一抓好』的共用快照，
+    不再由每一個使用者的請求各自打一次 TDX——這樣所有使用者看到的都是同一份、
+    由後台統一更新的資料，也大幅減少對 TDX 的查詢量。
+    只有在系統剛啟動、快照完全還是空的（例如第一次部署、還沒抓過任何資料）時，
+    才退回直接查一次 TDX，避免使用者看到完全空白的畫面。"""
     _ensure_realtime_cache_fresh()
     with _realtime_lock:
         by_route = _realtime_cache.get("eta_by_route") or {}
-        return list(by_route.get(route_name) or [])
+        data = by_route.get(route_name)
+        has_data = bool(by_route)
+    if data is not None:
+        return data
+    if has_data:
+        # 快照有資料，但這條路線剛好沒有任何一筆（可能真的沒有車在跑），
+        # 回傳空清單維持跟舊版一樣的語意，而不是回傳 None（那會被上層當成查詢失敗）。
+        return []
+    return _fetch_bus_data_from_tdx(route_name)
 
 
 @cached(600)
@@ -1028,14 +955,15 @@ def fetch_shapes_and_stops_parallel(routes):
     def worker(r):
         return r, fetch_route_shape(r), fetch_route_stop_positions(r)
 
-    futures = [EXECUTOR.submit(worker, r) for r in routes]
-    for fut in concurrent.futures.as_completed(futures):
-        try:
-            r, shapes, stops = fut.result()
-            shape_map[r] = shapes
-            stop_map[r] = stops
-        except Exception:
-            pass
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(worker, r) for r in routes]
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                r, shapes, stops = fut.result()
+                shape_map[r] = shapes
+                stop_map[r] = stops
+            except Exception:
+                pass
     return shape_map, stop_map
 
 
@@ -1046,27 +974,30 @@ def _fetch_bus_realtime_positions_from_tdx(route_name=None):
         url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/RealTimeByFrequency/City/Tainan/{route_name}?%24format=JSON"
     else:
         url = "https://tdx.transportdata.tw/api/basic/v2/Bus/RealTimeByFrequency/City/Tainan?%24format=JSON"
-    try:
-        res = requests.get(url, headers=tdx_headers(), timeout=10)
-        if res.status_code == 200:
+    res = tdx_get(url, timeout=25, retries=1)
+    if res is not None:
+        try:
             return res.json()
-    except Exception:
-        pass
+        except Exception:
+            pass
     return []
 
 
 def fetch_bus_realtime_positions(route_name=None):
-    """回傳即時公車 GPS 定位（不帶路線名稱＝全台南所有路線）。一律讀『後台排程
-    統一抓好』的共用快照（記憶體／檔案），不會由使用者的請求直接去打 TDX——
-    包含系統剛啟動、快照還是空的第一次查詢也一樣：只會拿到空結果，等後台排程
-    （最快 15 秒後）抓到資料，之後的查詢自然就有東西，不會因為『剛好卡在第一次』
-    就讓某個使用者的請求去獨自扛一次直接查 TDX 的延遲。"""
+    """回傳即時公車 GPS 定位（不帶路線名稱＝全台南所有路線）。改成讀『後台排程
+    每分鐘統一抓好』的共用快照，不再由每一個使用者的請求各自打一次 TDX。
+    只有在系統剛啟動、快照完全還是空的時候，才退回直接查一次 TDX 當暫時的資料來源。"""
     _ensure_realtime_cache_fresh()
     with _realtime_lock:
         by_route = _realtime_cache.get("positions_by_route") or {}
+        has_data = bool(by_route)
         if route_name:
-            return list(by_route.get(route_name, []))
-        return [b for lst in by_route.values() for b in lst]
+            result = list(by_route.get(route_name, []))
+        else:
+            result = [b for lst in by_route.values() for b in lst]
+    if has_data:
+        return result
+    return _fetch_bus_realtime_positions_from_tdx(route_name)
 
 
 # ── 即時公車資料（定位／到站預估）：後台每分鐘統一抓一次的共用快照 ─────────
@@ -1077,10 +1008,8 @@ REALTIME_POSITIONS_FILE = os.path.join(REALTIME_DATA_DIR, "positions.json")
 REALTIME_ETA_FILE = os.path.join(REALTIME_DATA_DIR, "eta.json")
 REALTIME_META_FILE = os.path.join(REALTIME_DATA_DIR, "meta.json")
 REALTIME_LOCK_FILE = os.path.join(REALTIME_DATA_DIR, ".poll.lock")
-REALTIME_POLL_SECONDS = 15      # 每 15 秒抓一次，跟前端自動更新的節奏對齊
-REALTIME_STALE_SECONDS = 45     # 超過這個秒數還沒成功更新過，視為「尚未更新資料」（約 3 輪份）
-REALTIME_PUSH_MIN_INTERVAL = 60 # 存檔／記憶體每 15 秒更新沒關係，但推送到 GitHub 不用跟著這麼頻繁，
-                                 # 這裡設下限，至少間隔這麼多秒才真的推送一次，避免對 GitHub 過度頻繁的請求
+REALTIME_POLL_SECONDS = 60      # 每 1 分鐘抓一次
+REALTIME_STALE_SECONDS = 90     # 超過這個秒數還沒成功更新過，視為「尚未更新資料」
 
 _realtime_lock = threading.Lock()
 _realtime_cache = {
@@ -1091,7 +1020,6 @@ _realtime_cache = {
     "last_attempt_ok": None,
 }
 _realtime_file_mtime = None  # 記憶體裡這份快照，是對應到「檔案」的哪個修改時間
-_last_realtime_push_at = 0   # 上一次真的推送到 GitHub 的時間戳（用來節流，見 REALTIME_PUSH_MIN_INTERVAL）
 
 
 def get_realtime_status():
@@ -1251,7 +1179,13 @@ def _realtime_poll_once():
             if positions_all:
                 _realtime_cache["positions_by_route"] = positions_by_route
             if eta_by_route:
-                _realtime_cache["eta_by_route"] = eta_by_route
+                # 用「合併」而不是整批覆蓋：這一輪如果只有部分路線查詢失敗
+                # （例如逐條路線平行查詢時，剛好某幾條逾時），失敗的路線保留
+                # 上一輪的舊資料，不要因為這一輪剛好沒查到，就讓它整個從快取
+                # 消失、被迫顯示成「尚未發車」甚至退回時刻表估計。
+                merged_eta = dict(_realtime_cache.get("eta_by_route") or {})
+                merged_eta.update(eta_by_route)
+                _realtime_cache["eta_by_route"] = merged_eta
             if ok:
                 _realtime_cache["updated_at"] = now_str
             _realtime_cache["last_attempt"] = now_str
@@ -1261,18 +1195,10 @@ def _realtime_poll_once():
 
         _write_realtime_snapshot(snapshot_positions, snapshot_eta, ok, now_str)
 
-        # 記憶體／本機檔案每 15 秒都會更新，但推送到 GitHub 沒必要跟著這麼頻繁
-        # ——那只是給「Render 重啟後找回上次資料」用的備份，不是使用者查詢會
-        # 用到的路徑（使用者查詢一律讀上面剛更新的記憶體／本機檔案）。這裡節流
-        # 成至少間隔 REALTIME_PUSH_MIN_INTERVAL 秒才真的推送一次，避免 15 秒
-        # 一輪、每輪都對 GitHub 送出好幾個 git 指令，徒增網路來回與负担。
-        global _last_realtime_push_at
-        if time.time() - _last_realtime_push_at >= REALTIME_PUSH_MIN_INTERVAL:
-            try:
-                push_realtime_backup(REALTIME_DATA_DIR)
-                _last_realtime_push_at = time.time()
-            except Exception as e:
-                print(f"❌ 即時資料推送到 GitHub 失敗：{e}", flush=True)
+        try:
+            push_realtime_backup(REALTIME_DATA_DIR)
+        except Exception as e:
+            print(f"❌ 即時資料推送到 GitHub 失敗：{e}", flush=True)
 
         print(f"{'✅' if ok else '⚠️'} 即時公車資料排程：定位 {len(positions_all or [])} 筆、"
               f"到站預估 {sum(len(v) for v in eta_by_route.values())} 筆（來源：{eta_source}），"
@@ -1300,7 +1226,6 @@ def _realtime_poll_loop():
 _load_realtime_cache_from_disk()
 realtime_thread = threading.Thread(target=_realtime_poll_loop, daemon=True)
 realtime_thread.start()
-start_realtime_watchdog(REALTIME_DATA_DIR)
 
 
 def find_nearby_stops(all_stops, lat, lon, radius_km=0.5):
@@ -1340,13 +1265,14 @@ def _fetch_all_route_stops_parallel(routes):
     """平行為多條路線取得站名清單。內部走 fetch_route_stops，
     每條路線都會優先讀 data/route 裡的存檔，沒有才即時查並自動存檔。"""
     result = {}
-    futures = {EXECUTOR.submit(fetch_route_stops, r): r for r in routes}
-    for fut in concurrent.futures.as_completed(futures):
-        r = futures[fut]
-        try:
-            result[r] = fut.result()
-        except Exception:
-            result[r] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_route_stops, r): r for r in routes}
+        for fut in concurrent.futures.as_completed(futures):
+            r = futures[fut]
+            try:
+                result[r] = fut.result()
+            except Exception:
+                result[r] = []
     return result
 
 
@@ -2318,13 +2244,14 @@ def api_update_cache():
     一般情況下不需要手動按這顆按鈕——每條路線第一次被查詢或在地圖上顯示時，
     就會自動存檔；這顆按鈕只是用來一次性強制刷新全部路線的最新資料。"""
     count = 0
-    futures = {EXECUTOR.submit(_fetch_and_save_stop_data, r): r for r in get_all_known_routes()}
-    for fut in concurrent.futures.as_completed(futures):
-        try:
-            if fut.result():
-                count += 1
-        except Exception:
-            pass
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(_fetch_and_save_stop_data, r): r for r in get_all_known_routes()}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                if fut.result():
+                    count += 1
+            except Exception:
+                pass
     # 清除相關記憶體快取，讓下一次查詢立即反映新資料
     _cache_store.clear()
     return jsonify({"status": "success", "count": count})
@@ -2450,18 +2377,10 @@ def api_chat():
 
 
 if __name__ == '__main__':
-    # 這只是本機開發用的啟動方式：debug=True 的重載器（reloader）會多開一個
-    # 子行程，等於把上面 scheduler_thread／realtime_thread 都各自重複跑兩份
-    # （重複備份、重複打 TDX），本機測試沒關係，但正式站絕對不要用這行來跑。
-    # 正式環境（Render）請用 gunicorn 啟動，例如 start.sh 裡放：
-    #   gunicorn -w 1 --threads 24 --worker-class gthread --timeout 60 -b 0.0.0.0:$PORT app:app
-    # 只開 1 個 worker（process）是刻意的：這支程式的登入狀態、最愛路線、
-    # 即時公車快取（SESSION_STORE / _cache_store / _realtime_cache）都存在
-    # 記憶體裡，如果開多個 worker process，每個 process 會各自擁有一份互不
-    # 相通的記憶體，使用者可能這次連到 A、下次連到 B，找不到自己剛存的資料，
-    # 背景排程（備份、抓即時公車）也會被重複啟動好幾份。用「1 個 process、
-    # 多條 thread」則可以在維持同一份記憶體狀態的前提下，同時應付大量使用者
-    # ——因為這支程式大部分時間都在等外部 API（TDX／OSRM）回應，thread 在等待
-    # 網路 I/O 時會釋放 GIL，讓其他 thread 可以繼續處理別的請求，一千人同時
-    # 上線大多也只是同時在「等」，並不會真的一千個人同時佔用 CPU。
-    app.run(debug=False, threaded=True, port=int(os.environ.get("PORT", 5000)))
+    # 只有明確設定 FLASK_DEBUG=1 才會開 debug 模式（會洩漏詳細錯誤堆疊、也會拖慢速度），
+    # 避免哪天不小心直接用 `python app.py` 跑在正式環境時，忘記帶入 debug=True。
+    # 正式環境還是強烈建議用 gunicorn（見 start.sh）啟動，而不是靠這個內建開發伺服器；
+    # 這裡開 threaded=True 純粹是讓「不小心」用這個內建伺服器時，至少還能同時處理
+    # 一個以上的請求，不會退化成完全一個一個排隊。
+    debug_mode = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(debug=debug_mode, threaded=True, port=int(os.environ.get("PORT", 5000)))
