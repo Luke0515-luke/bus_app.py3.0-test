@@ -893,23 +893,15 @@ def _fetch_eta_by_route_parallel(routes):
 
 
 def fetch_bus_data(route_name):
-    """回傳某路線的到站預估時間。改成讀『後台排程每分鐘統一抓好』的共用快照，
-    不再由每一個使用者的請求各自打一次 TDX——這樣所有使用者看到的都是同一份、
-    由後台統一更新的資料，也大幅減少對 TDX 的查詢量。
-    只有在系統剛啟動、快照完全還是空的（例如第一次部署、還沒抓過任何資料）時，
-    才退回直接查一次 TDX，避免使用者看到完全空白的畫面。"""
+    """回傳某路線的到站預估時間。一律讀『後台排程統一抓好』的共用快照，
+    不再由每一個使用者的請求各自打一次 TDX——包含系統剛啟動、快照還是空的
+    第一次查詢也一樣，只會拿到空清單，不會退回去直接查 TDX。這樣所有使用者
+    看到的都是同一份、由後台統一更新的資料，也不會有『剛好卡在第一次』的
+    請求要獨自承擔一次直接查 TDX 的延遲。"""
     _ensure_realtime_cache_fresh()
     with _realtime_lock:
         by_route = _realtime_cache.get("eta_by_route") or {}
-        data = by_route.get(route_name)
-        has_data = bool(by_route)
-    if data is not None:
-        return data
-    if has_data:
-        # 快照有資料，但這條路線剛好沒有任何一筆（可能真的沒有車在跑），
-        # 回傳空清單維持跟舊版一樣的語意，而不是回傳 None（那會被上層當成查詢失敗）。
-        return []
-    return _fetch_bus_data_from_tdx(route_name)
+        return list(by_route.get(route_name) or [])
 
 
 @cached(600)
@@ -1043,20 +1035,17 @@ def _fetch_bus_realtime_positions_from_tdx(route_name=None):
 
 
 def fetch_bus_realtime_positions(route_name=None):
-    """回傳即時公車 GPS 定位（不帶路線名稱＝全台南所有路線）。改成讀『後台排程
-    每分鐘統一抓好』的共用快照，不再由每一個使用者的請求各自打一次 TDX。
-    只有在系統剛啟動、快照完全還是空的時候，才退回直接查一次 TDX 當暫時的資料來源。"""
+    """回傳即時公車 GPS 定位（不帶路線名稱＝全台南所有路線）。一律讀『後台排程
+    統一抓好』的共用快照（記憶體／檔案），不會由使用者的請求直接去打 TDX——
+    包含系統剛啟動、快照還是空的第一次查詢也一樣：只會拿到空結果，等後台排程
+    （最快 15 秒後）抓到資料，之後的查詢自然就有東西，不會因為『剛好卡在第一次』
+    就讓某個使用者的請求去獨自扛一次直接查 TDX 的延遲。"""
     _ensure_realtime_cache_fresh()
     with _realtime_lock:
         by_route = _realtime_cache.get("positions_by_route") or {}
-        has_data = bool(by_route)
         if route_name:
-            result = list(by_route.get(route_name, []))
-        else:
-            result = [b for lst in by_route.values() for b in lst]
-    if has_data:
-        return result
-    return _fetch_bus_realtime_positions_from_tdx(route_name)
+            return list(by_route.get(route_name, []))
+        return [b for lst in by_route.values() for b in lst]
 
 
 # ── 即時公車資料（定位／到站預估）：後台每分鐘統一抓一次的共用快照 ─────────
@@ -1067,8 +1056,10 @@ REALTIME_POSITIONS_FILE = os.path.join(REALTIME_DATA_DIR, "positions.json")
 REALTIME_ETA_FILE = os.path.join(REALTIME_DATA_DIR, "eta.json")
 REALTIME_META_FILE = os.path.join(REALTIME_DATA_DIR, "meta.json")
 REALTIME_LOCK_FILE = os.path.join(REALTIME_DATA_DIR, ".poll.lock")
-REALTIME_POLL_SECONDS = 60      # 每 1 分鐘抓一次
-REALTIME_STALE_SECONDS = 90     # 超過這個秒數還沒成功更新過，視為「尚未更新資料」
+REALTIME_POLL_SECONDS = 15      # 每 15 秒抓一次，跟前端自動更新的節奏對齊
+REALTIME_STALE_SECONDS = 45     # 超過這個秒數還沒成功更新過，視為「尚未更新資料」（約 3 輪份）
+REALTIME_PUSH_MIN_INTERVAL = 60 # 存檔／記憶體每 15 秒更新沒關係，但推送到 GitHub 不用跟著這麼頻繁，
+                                 # 這裡設下限，至少間隔這麼多秒才真的推送一次，避免對 GitHub 過度頻繁的請求
 
 _realtime_lock = threading.Lock()
 _realtime_cache = {
@@ -1079,6 +1070,7 @@ _realtime_cache = {
     "last_attempt_ok": None,
 }
 _realtime_file_mtime = None  # 記憶體裡這份快照，是對應到「檔案」的哪個修改時間
+_last_realtime_push_at = 0   # 上一次真的推送到 GitHub 的時間戳（用來節流，見 REALTIME_PUSH_MIN_INTERVAL）
 
 
 def get_realtime_status():
@@ -1248,10 +1240,18 @@ def _realtime_poll_once():
 
         _write_realtime_snapshot(snapshot_positions, snapshot_eta, ok, now_str)
 
-        try:
-            push_realtime_backup(REALTIME_DATA_DIR)
-        except Exception as e:
-            print(f"❌ 即時資料推送到 GitHub 失敗：{e}", flush=True)
+        # 記憶體／本機檔案每 15 秒都會更新，但推送到 GitHub 沒必要跟著這麼頻繁
+        # ——那只是給「Render 重啟後找回上次資料」用的備份，不是使用者查詢會
+        # 用到的路徑（使用者查詢一律讀上面剛更新的記憶體／本機檔案）。這裡節流
+        # 成至少間隔 REALTIME_PUSH_MIN_INTERVAL 秒才真的推送一次，避免 15 秒
+        # 一輪、每輪都對 GitHub 送出好幾個 git 指令，徒增網路來回與负担。
+        global _last_realtime_push_at
+        if time.time() - _last_realtime_push_at >= REALTIME_PUSH_MIN_INTERVAL:
+            try:
+                push_realtime_backup(REALTIME_DATA_DIR)
+                _last_realtime_push_at = time.time()
+            except Exception as e:
+                print(f"❌ 即時資料推送到 GitHub 失敗：{e}", flush=True)
 
         print(f"{'✅' if ok else '⚠️'} 即時公車資料排程：定位 {len(positions_all or [])} 筆、"
               f"到站預估 {sum(len(v) for v in eta_by_route.values())} 筆（來源：{eta_source}），"
