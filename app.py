@@ -790,6 +790,29 @@ def fetch_bus_data_all():
     return None
 
 
+def _fetch_eta_by_route_parallel(routes):
+    """備援方案：如果『不帶路線名稱、一次查全部路線』的 fetch_bus_data_all()
+    沒有拿到任何資料（有可能 TDX 這個 API 其實不支援這種一次查全部路線的寫法），
+    改成逐條路線平行查詢當備援——用執行緒池同時查，不是一條一條依序等，
+    確保到站資訊還是查得到，不會因為城市級 API 不支援就整個開天窗。
+    回傳 {路線名稱: [到站資訊項目, ...]}，key 直接用查詢時的路線名稱，
+    不依賴回傳資料裡有沒有正確的 RouteName 欄位。"""
+    result = {}
+    if not routes:
+        return result
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+        future_to_route = {ex.submit(_fetch_bus_data_from_tdx, r): r for r in routes}
+        for future in concurrent.futures.as_completed(future_to_route):
+            r = future_to_route[future]
+            try:
+                data = future.result()
+            except Exception:
+                data = None
+            if data:
+                result[r] = data
+    return result
+
+
 def fetch_bus_data(route_name):
     """回傳某路線的到站預估時間。改成讀『後台排程每分鐘統一抓好』的共用快照，
     不再由每一個使用者的請求各自打一次 TDX——這樣所有使用者看到的都是同一份、
@@ -1108,8 +1131,6 @@ def _realtime_poll_once():
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         positions_all = _fetch_bus_realtime_positions_from_tdx(None)
-        eta_all = fetch_bus_data_all()
-        ok = bool(positions_all) or bool(eta_all)
 
         positions_by_route = {}
         for b in (positions_all or []):
@@ -1117,16 +1138,28 @@ def _realtime_poll_once():
             if r:
                 positions_by_route.setdefault(r, []).append(b)
 
-        eta_by_route = {}
-        for item in (eta_all or []):
-            r = (item.get("RouteName") or {}).get("Zh_tw", "")
-            if r:
-                eta_by_route.setdefault(r, []).append(item)
+        eta_all = fetch_bus_data_all()
+        eta_source = "city-wide"
+        if eta_all:
+            eta_by_route = {}
+            for item in eta_all:
+                r = (item.get("RouteName") or {}).get("Zh_tw", "")
+                if r:
+                    eta_by_route.setdefault(r, []).append(item)
+        else:
+            # 城市級「一次查全部路線」沒有拿到資料，改成逐條路線平行查詢當備援，
+            # 確保到站資訊還是查得到，不會讓 fetch_bus_data() 一直讀到空快取，
+            # 進而每個使用者的請求又被迫退回去直接查一次 TDX（那才是真正會讓
+            # 頁面『跑很久』的原因）。
+            eta_source = "per-route fallback"
+            eta_by_route = _fetch_eta_by_route_parallel(get_all_known_routes())
+
+        ok = bool(positions_all) or bool(eta_by_route)
 
         with _realtime_lock:
             if positions_all:
                 _realtime_cache["positions_by_route"] = positions_by_route
-            if eta_all:
+            if eta_by_route:
                 _realtime_cache["eta_by_route"] = eta_by_route
             if ok:
                 _realtime_cache["updated_at"] = now_str
@@ -1143,7 +1176,8 @@ def _realtime_poll_once():
             print(f"❌ 即時資料推送到 GitHub 失敗：{e}", flush=True)
 
         print(f"{'✅' if ok else '⚠️'} 即時公車資料排程：定位 {len(positions_all or [])} 筆、"
-              f"到站預估 {len(eta_all or [])} 筆，時間 {now_str}", flush=True)
+              f"到站預估 {sum(len(v) for v in eta_by_route.values())} 筆（來源：{eta_source}），"
+              f"時間 {now_str}", flush=True)
     finally:
         try:
             fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
