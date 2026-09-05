@@ -40,7 +40,11 @@ except ImportError:
 
 from pull_backup import pull_backup
 from push_backup import git_push_backup
-from realtime_sync import pull_realtime_backup, push_realtime_backup
+from realtime_sync import (
+    pull_realtime_backup,
+    push_realtime_backup,
+    start_realtime_watchdog
+)
 import asyncio
 import threading
 import shutil
