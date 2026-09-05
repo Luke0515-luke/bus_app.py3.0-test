@@ -2,544 +2,273 @@
 <html lang="zh-Hant">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<title>🚌 智慧公車｜台南公車 AI 助理</title>
-
-<!-- Tailwind CSS（Play CDN，免建置直接用）-->
-<script src="https://cdn.tailwindcss.com"></script>
-<script>
-  tailwind.config = {
-    darkMode: 'class',
-    theme: {
-      extend: {
-        colors: {
-          panel: '#07130f',
-          card:  '#0b1d17',
-        },
-        fontFamily: {
-          display: ['"Space Grotesk"', '"Noto Sans TC"', 'sans-serif'],
-        },
-        boxShadow: {
-          neon: '0 0 0 1px rgba(45,212,191,.25), 0 0 30px -6px rgba(45,212,191,.35)',
-          'neon-lg': '0 0 0 1px rgba(45,212,191,.3), 0 0 45px -8px rgba(45,212,191,.55)',
-        },
-      }
-    }
-  }
-</script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Noto+Sans+TC:wght@400;500;700&display=swap" rel="stylesheet">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🚌 台南公車 AI 助理</title>
+<link rel="stylesheet" href="{{ static_url('css/style.css') }}">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-
-<!--
-  ══════════════════════════════════════════════════════════════════
-  這個 <style> 區塊只放「Tailwind 工具類別做不到、且跟 app.js 既有
-  行為綁在一起」的最小必要 CSS：
-    1) app.js 用 classList 直接切換的狀態（sidebar-open／active／
-       expanded／hidden 這種），需要對應的 CSS 規則接住，光靠 Tailwind
-       的靜態 class 不會自動生效。
-    2) app.js 用字串樣板動態插入畫面的內容（時間軸、聊天氣泡、標籤、
-       彈出視窗…），這些 HTML 是 JS 產生的，沒辦法直接寫成 Tailwind
-       的 class（除非改寫 app.js，但這次只改版面／樣式，不動邏輯），
-       所以維持用一般 class name，在這裡統一定義成霓虹深色風格。
-    3) Leaflet 地圖套件自己產生的 DOM（圖層、彈出框），只能用一般
-       CSS 覆寫。
-  除此之外，畫面上看得到的排版、間距、顏色、卡片樣式，全部都是用
-  Tailwind 的 utility class 直接寫在 HTML 上，沒有另外寫 style.css。
-  ══════════════════════════════════════════════════════════════════
--->
-<style>
-  html, body { height: 100%; }
-  body { font-family: 'Noto Sans TC', -apple-system, sans-serif; }
-  .font-display { font-family: 'Space Grotesk', 'Noto Sans TC', sans-serif; }
-
-  /* ── 側邊選單抽屜：app.js 對 <body> 加/移除 sidebar-open ───── */
-  #sidebar {
-    transform: translateX(-100%);
-    transition: transform .28s ease;
-  }
-  body.sidebar-open #sidebar { transform: translateX(0); }
-  #sidebar-backdrop {
-    opacity: 0; pointer-events: none; transition: opacity .28s ease;
-  }
-  body.sidebar-open #sidebar-backdrop { opacity: 1; pointer-events: auto; }
-
-  /* ── 通用工具（app.js 直接 toggle 這些 class）───────────────── */
-  .hidden { display: none !important; }
-  .page.hidden { display: none !important; }
-  .subpage.hidden { display: none !important; }
-
-  /* 到站提醒橫幅（reminder-banner）鈴聲觸發時由 JS 顯示 */
-  #reminder-banner {
-    position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
-    z-index: 1200; max-width: 92vw;
-  }
-
-  /* ── 通用按鈕基礎樣式（給 app.js 動態產生、只帶 class="btn" 的按鈕接住外觀）── */
-  .btn {
-    display: inline-flex; align-items: center; justify-content: center; gap: 4px;
-    padding: 8px 14px; border-radius: 12px; font-size: 13px; color: #eafff9;
-    background: rgba(255,255,255,.05); border: 1px solid rgba(45,212,191,.2);
-    cursor: pointer; transition: background .15s ease;
-  }
-  .btn:hover { background: rgba(255,255,255,.09); }
-  .btn-block { display: flex; width: 100%; margin-top: 6px; }
-
-  /* ── 路線篩選鍵盤：選色／選數字，按下後 active 呈現按下感 ───── */
-  .filter-btn.active {
-    box-shadow: inset 0 0 0 2px #fff, 0 0 14px -2px rgba(45,212,191,.8);
-    transform: translateY(1px);
-  }
-  .dir-btn.active {
-    background: rgba(45,212,191,.9) !important; color: #06201b !important;
-    border-color: rgba(45,212,191,.9) !important; font-weight: 700;
-  }
-
-  /* ── 首頁功能磚：維持原本各自的識別色，但改成霓虹玻璃卡片風 ─── */
-  .home-tile {
-    display: flex; flex-direction: column; align-items: center; justify-content: center;
-    gap: 6px; aspect-ratio: 1 / 1; border-radius: 20px; color: #eafff9;
-    background: linear-gradient(155deg, rgba(255,255,255,.10), rgba(255,255,255,.02));
-    border: 1px solid rgba(45,212,191,.22);
-    box-shadow: 0 0 0 1px rgba(255,255,255,.03) inset, 0 10px 24px -14px rgba(0,0,0,.6);
-    transition: transform .15s ease, box-shadow .2s ease;
-  }
-  .home-tile:active { transform: scale(.95); }
-  .home-tile-icon { font-size: 26px; filter: drop-shadow(0 0 6px rgba(45,212,191,.35)); }
-  .home-tile-map    { box-shadow: 0 0 22px -8px rgba(52,211,153,.55), inset 0 0 0 1px rgba(52,211,153,.35); }
-  .home-tile-filter { box-shadow: 0 0 22px -8px rgba(56,189,248,.55), inset 0 0 0 1px rgba(56,189,248,.35); }
-  .home-tile-nearby { box-shadow: 0 0 22px -8px rgba(217,119,6,.55), inset 0 0 0 1px rgba(217,119,6,.35); }
-  .home-tile-chat   { box-shadow: 0 0 22px -8px rgba(167,139,250,.55), inset 0 0 0 1px rgba(167,139,250,.35); }
-  .home-tile-fav    { box-shadow: 0 0 22px -8px rgba(250,204,21,.55), inset 0 0 0 1px rgba(250,204,21,.35); }
-  .home-tile-yellow { box-shadow: 0 0 22px -8px rgba(245,158,11,.55), inset 0 0 0 1px rgba(245,158,11,.35); }
-  .home-tile-adv    { box-shadow: 0 0 22px -8px rgba(45,212,191,.6), inset 0 0 0 1px rgba(45,212,191,.4); }
-  .home-tile-more   { box-shadow: 0 0 22px -8px rgba(148,163,184,.5), inset 0 0 0 1px rgba(148,163,184,.35); }
-
-  /* ── 地圖控制面板：手機版預設收合，展開鍵切換 expanded ──────── */
-  #map-panel-body { display: none; max-height: 48vh; overflow-y: auto; }
-  #map-panel.expanded #map-panel-body { display: block; }
-
-  /* ── 對話記錄／最愛路線清單裡，JS 動態產生的項目 ─────────────── */
-  .fav-row, .sess-item, .route-item, .reminder-item {
-    display: flex; align-items: center; justify-content: space-between; gap: 8px;
-    background: rgba(255,255,255,.04); border: 1px solid rgba(45,212,191,.14);
-    border-radius: 12px; padding: 9px 12px; margin-top: 8px; color: #eafff9; font-size: 13px;
-  }
-  .route-item.active { background: rgba(45,212,191,.14); border-color: rgba(45,212,191,.5); }
-  #chat-session-list .sess-item button.sess-select.active { color: #2dd4bf; font-weight: 700; }
-  .fav-main, .sess-select, .route-suggest { background: none; border: none; color: inherit; text-align: left; flex: 1; cursor: pointer; font: inherit; }
-  .fav-remove, .sess-del, .reminder-delete-btn { background: none; border: none; color: #fb7185; cursor: pointer; font-size: 15px; }
-  .route-count { color: #5eead4; font-size: 12px; }
-  .route-dot { display: inline-block; width: 9px; height: 9px; border-radius: 999px; margin-right: 6px; }
-  .route-suggest-save { margin-left: 6px; color: #facc15; background: none; border: none; cursor: pointer; }
-
-  /* ── 通用資訊 / 狀態方塊 ─────────────────────────────────────── */
-  .info-box, .success-box, .warning-box, .error-box {
-    border-radius: 14px; padding: 10px 14px; font-size: 13px; margin-top: 10px; line-height: 1.6;
-  }
-  .info-box    { background: rgba(255,255,255,.05); border: 1px solid rgba(148,163,184,.25); color: #cbd5e1; }
-  .success-box { background: rgba(16,185,129,.12); border: 1px solid rgba(16,185,129,.4); color: #6ee7b7; }
-  .warning-box { background: rgba(245,158,11,.12); border: 1px solid rgba(245,158,11,.4); color: #fcd34d; }
-  .error-box   { background: rgba(244,63,94,.12); border: 1px solid rgba(244,63,94,.4); color: #fda4af; }
-  .caption { color: #7fa89d; font-size: 12px; line-height: 1.6; }
-
-  /* ── 沿線各站動態：時間軸（畫面主視覺之一）──────────────────── */
-  .timeline-container { position: relative; padding-left: 26px; margin-top: 10px; }
-  .timeline-container::before {
-    content: ''; position: absolute; left: 9px; top: 6px; bottom: 6px; width: 2px;
-    background: linear-gradient(180deg, rgba(45,212,191,.7), rgba(45,212,191,.08));
-  }
-  .timeline-item { position: relative; padding-bottom: 16px; }
-  .timeline-item:last-child { padding-bottom: 0; }
-  .timeline-circle {
-    position: absolute; left: -26px; top: 14px; width: 12px; height: 12px; border-radius: 999px;
-    background: #0b1d17; border: 2px solid rgba(148,163,184,.55);
-  }
-  .timeline-item.waiting-stop .timeline-circle {
-    border-color: #2dd4bf; box-shadow: 0 0 0 4px rgba(45,212,191,.18), 0 0 14px rgba(45,212,191,.7);
-  }
-  .station-box {
-    display: flex; align-items: center; justify-content: space-between; gap: 10px;
-    background: rgba(255,255,255,.045); border: 1px solid rgba(148,163,184,.16);
-    border-radius: 14px; padding: 10px 14px;
-  }
-  /* 等候站：放大呈現，呼應截圖裡那張醒目的大字卡片 */
-  .timeline-item.waiting-stop .station-box {
-    background: linear-gradient(135deg, rgba(45,212,191,.16), rgba(45,212,191,.04));
-    border: 1px solid rgba(45,212,191,.55);
-    box-shadow: 0 0 30px -10px rgba(45,212,191,.6);
-    padding: 16px;
-  }
-  .timeline-item.waiting-stop .time-badge { font-size: 30px; font-weight: 700; color: #5eead4; font-family: 'Space Grotesk', sans-serif; }
-  .station-info-top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-  .station-name { font-weight: 600; color: #eafff9; }
-  .station-info-ubike { margin-top: 4px; }
-  .time-badge { font-size: 13px; font-weight: 700; white-space: nowrap; padding: 4px 10px; border-radius: 999px; }
-  .ts-green  { color: #34d399; background: rgba(52,211,153,.12); }
-  .ts-orange { color: #fb923c; background: rgba(251,146,60,.15); }
-  .ts-red    { color: #fb7185; background: rgba(251,113,133,.15); }
-  .ts-gray   { color: #94a3b8; background: rgba(148,163,184,.12); }
-  .ts-blue   { color: #38bdf8; background: rgba(56,189,248,.15); }
-  .bus-tag, .wheelchair-tag, .no-wheelchair-tag, .ev-tag, .branch-tag, .ubike-tag, .tag {
-    font-size: 11px; padding: 2px 8px; border-radius: 999px; background: rgba(148,163,184,.14); color: #cbd5e1;
-  }
-  .ev-tag { color: #facc15; background: rgba(250,204,21,.14); }
-  .branch-tag { color: #f97316; background: rgba(249,115,22,.14); }
-  .wheelchair-tag { color: #60a5fa; background: rgba(96,165,250,.14); }
-
-  /* ── AI 對話氣泡 ─────────────────────────────────────────────── */
-  .chat-msg { max-width: 86%; padding: 10px 14px; border-radius: 16px; margin-top: 8px; font-size: 14px; line-height: 1.6; }
-  .chat-msg.user { margin-left: auto; background: linear-gradient(135deg,#0d9488,#0f766e); color: #ecfeff; border-bottom-right-radius: 4px; }
-  .chat-msg.assistant { margin-right: auto; background: rgba(255,255,255,.06); color: #e2e8f0; border: 1px solid rgba(148,163,184,.15); border-bottom-left-radius: 4px; }
-
-  /* ── 固定時刻表 ──────────────────────────────────────────────── */
-  .timetable-group { margin-top: 10px; }
-  .timetable-direction { font-weight: 700; color: #5eead4; margin-top: 10px; }
-  .timetable-dir-title { font-size: 13px; }
-  .timetable-days { color: #7fa89d; font-size: 12px; margin: 2px 0 6px; }
-  .timetable-times { display: flex; flex-wrap: wrap; gap: 6px; }
-  .timetable-time { font-size: 12px; padding: 3px 8px; border-radius: 8px; background: rgba(255,255,255,.05); border: 1px solid rgba(148,163,184,.18); }
-
-  /* ── 附近站牌／地圖 站點清單 ─────────────────────────────────── */
-  .stop-item, .bus-list-item { padding: 9px 12px; border-radius: 12px; background: rgba(255,255,255,.04); border: 1px solid rgba(148,163,184,.14); margin-top: 8px; font-size: 13px; }
-  .reminder-item.reminder-item { flex-direction: column; align-items: flex-start; }
-
-  /* ── Leaflet 地圖客製 ────────────────────────────────────────── */
-  #leaflet-map { background: #07130f; }
-  .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: #0b1d17; color: #eafff9; }
-  .bus-popup .tag { display: inline-block; margin: 3px 3px 0 0; }
-  .station-info { flex: 1; min-width: 0; }
-
-  /* 觸控裝置最小點擊尺寸 */
-  button, select, input[type="text"], input[type="number"], input[type="password"] { min-height: 40px; }
-
-  ::-webkit-scrollbar { width: 6px; height: 6px; }
-  ::-webkit-scrollbar-thumb { background: rgba(45,212,191,.35); border-radius: 999px; }
-</style>
 </head>
+<body id="body-root">
 
-<body id="body-root" class="min-h-screen bg-[#040b09] text-slate-100 [background-image:radial-gradient(ellipse_120%_60%_at_50%_-10%,rgba(16,185,129,.18),transparent),radial-gradient(ellipse_80%_50%_at_100%_100%,rgba(45,212,191,.10),transparent)]">
-
-<!-- 漢堡選單按鈕：固定右上角 -->
-<button id="btn-mobile-menu" aria-label="開啟選單"
-  class="fixed top-3 right-3 z-[1100] w-11 h-11 rounded-2xl bg-[#0b1d17]/90 border border-teal-400/30 shadow-neon flex items-center justify-center text-xl backdrop-blur">
-  ☰
-</button>
-<div id="sidebar-backdrop" class="fixed inset-0 z-[1040] bg-black/60 backdrop-blur-sm"></div>
+<button id="btn-mobile-menu" class="mobile-menu-btn" aria-label="開啟選單">☰</button>
+<div id="sidebar-backdrop"></div>
 <div id="reminder-banner" class="hidden"></div>
 
-<div id="app" class="flex min-h-screen">
+<div id="app">
 
-  <!-- ══════════════ 左側／抽屜選單 ══════════════ -->
-  <aside id="sidebar" class="fixed top-0 left-0 z-[1050] h-full w-[86%] max-w-[340px] overflow-y-auto bg-[#07130f] border-r border-teal-400/15 p-5 space-y-5">
-    <h1 class="font-display text-lg font-bold text-teal-300 flex items-center gap-2">🚌 智慧公車助理</h1>
+  <!-- ══════════════ 左側常駐側邊欄 ══════════════ -->
+  <aside id="sidebar">
+    <h1 class="sidebar-title">🚌 台南公車助理</h1>
 
-    <div class="space-y-2">
-      <button id="btn-font-toggle" class="w-full text-left px-4 py-3 rounded-xl bg-white/5 border border-teal-400/15 text-sm hover:bg-white/10">🔠 放大字體（視障輔助）</button>
-      <button id="btn-page-toggle" class="w-full text-left px-4 py-3 rounded-xl bg-white/5 border border-teal-400/15 text-sm hover:bg-white/10">🗺️ 公車即時地圖</button>
-    </div>
+    <button id="btn-font-toggle" class="btn btn-block">🔠 放大字體（視障輔助）</button>
+    <button id="btn-page-toggle" class="btn btn-block">🗺️ 公車即時地圖</button>
 
-    <hr class="border-teal-400/10">
+    <hr>
 
-    <div>
-      <button id="btn-chat-history-toggle" class="w-full text-left px-4 py-3 rounded-xl bg-white/5 border border-teal-400/15 text-sm hover:bg-white/10">💬 AI 對話記錄</button>
-      <div id="chat-history-panel" class="hidden mt-3 space-y-2">
-        <h3 class="text-sm text-teal-300 font-semibold">📋 對話記錄</h3>
-        <button id="btn-new-chat" class="w-full px-3 py-2 rounded-xl bg-teal-500/15 border border-teal-400/30 text-sm text-teal-200">➕ 新對話</button>
-        <div id="chat-session-list"></div>
-        <hr class="border-teal-400/10">
-      </div>
+    <button id="btn-chat-history-toggle" class="btn btn-block">💬 AI 對話記錄</button>
+    <div id="chat-history-panel" class="hidden">
+      <h3>📋 對話記錄</h3>
+      <button id="btn-new-chat" class="btn btn-block">➕ 新對話</button>
+      <div id="chat-session-list"></div>
+      <hr>
     </div>
 
     <div id="favorites-section" class="hidden">
-      <h3 class="text-sm text-teal-300 font-semibold mb-1">⭐ 最愛路線</h3>
+      <h3>⭐ 最愛路線</h3>
       <div id="favorites-list"></div>
-      <hr class="border-teal-400/10 mt-3">
+      <hr>
     </div>
 
     <div id="recent-section" class="hidden">
-      <h3 class="text-sm text-teal-300 font-semibold mb-1">🕐 最近查詢</h3>
+      <h3>🕐 最近查詢</h3>
       <div id="recent-list"></div>
-      <hr class="border-teal-400/10 mt-3">
+      <hr>
     </div>
 
     <div id="reminders-section" class="hidden">
-      <h3 class="text-sm text-teal-300 font-semibold mb-1">🔔 到站鈴聲提醒</h3>
+      <h3>🔔 到站鈴聲提醒</h3>
       <div id="reminders-list"></div>
-      <label class="mt-2 flex items-center gap-2 text-xs text-slate-400 cursor-pointer">
-        <input type="checkbox" id="reminder-sound-enabled" checked class="w-auto min-h-0 accent-teal-400">
+      <label style="margin-top:6px;display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="reminder-sound-enabled" checked style="width:auto;margin:0;">
         啟用鈴聲提醒（需要瀏覽器分頁保持開啟）
       </label>
-      <hr class="border-teal-400/10 mt-3">
+      <hr>
     </div>
 
     <!-- 進階查詢 -->
-    <details class="expander rounded-xl bg-white/5 border border-teal-400/15 p-3" id="details-advsearch">
-      <summary class="cursor-pointer text-sm font-semibold text-teal-200">🔍 進階查詢（站到站）</summary>
-      <p class="caption mt-2">輸入起站與終點，找出直達或轉乘一次的路線</p>
-      <div id="adv-search-body" class="space-y-2 mt-2">
-        <label class="text-xs text-slate-400 block">🔎 快速篩選站名（可不填，直接在下面欄位打字或選單找也可以）</label>
-        <input type="text" id="adv-stop-search" placeholder="輸入關鍵字篩選下面的站名選單..." class="w-full px-3 py-2 rounded-lg bg-[#0b1d17] border border-teal-400/20 text-sm">
-        <label class="text-xs text-slate-400 block">出發站</label>
-        <input type="text" id="adv-start" list="adv-start-list" placeholder="請選擇或輸入站名..." class="w-full px-3 py-2 rounded-lg bg-[#0b1d17] border border-teal-400/20 text-sm">
+    <details class="expander" id="details-advsearch">
+      <summary>🔍 進階查詢（站到站）</summary>
+      <p class="caption">輸入起站與終點，找出直達或轉乘一次的路線</p>
+      <div id="adv-search-body">
+        <label>🔎 快速篩選站名（可不填，直接在下面欄位打字或選單找也可以）</label>
+        <input type="text" id="adv-stop-search" placeholder="輸入關鍵字篩選下面的站名選單...">
+        <label>出發站</label>
+        <input type="text" id="adv-start" list="adv-start-list" placeholder="請選擇或輸入站名...">
         <datalist id="adv-start-list"></datalist>
-        <label class="text-xs text-slate-400 block">目的站</label>
-        <input type="text" id="adv-end" list="adv-end-list" placeholder="請選擇或輸入站名..." class="w-full px-3 py-2 rounded-lg bg-[#0b1d17] border border-teal-400/20 text-sm">
+        <label>目的站</label>
+        <input type="text" id="adv-end" list="adv-end-list" placeholder="請選擇或輸入站名...">
         <datalist id="adv-end-list"></datalist>
-        <button id="btn-adv-search" class="w-full px-3 py-2 rounded-xl bg-teal-500/15 border border-teal-400/30 text-sm text-teal-200">🔎 查詢路線</button>
+        <button id="btn-adv-search" class="btn btn-block">🔎 查詢路線</button>
         <div id="adv-search-result"></div>
       </div>
     </details>
 
     <!-- 帳號登入 -->
-    <details class="expander rounded-xl bg-white/5 border border-teal-400/15 p-3" id="details-account">
-      <summary class="cursor-pointer text-sm font-semibold text-teal-200">👤 帳號登入</summary>
-      <div id="account-logged-out" class="space-y-2 mt-2">
+    <details class="expander" id="details-account">
+      <summary>👤 帳號登入</summary>
+      <div id="account-logged-out">
         <p class="caption">登入後，最愛路線、最近查詢、AI 對話記錄都會綁定在帳號上，換裝置、換瀏覽器登入一樣看得到。</p>
-        <label class="text-xs text-slate-400 block">帳號</label>
-        <input type="text" id="auth-username" placeholder="輸入帳號..." class="w-full px-3 py-2 rounded-lg bg-[#0b1d17] border border-teal-400/20 text-sm">
-        <label class="text-xs text-slate-400 block">密碼</label>
-        <input type="password" id="auth-password" placeholder="輸入密碼..." class="w-full px-3 py-2 rounded-lg bg-[#0b1d17] border border-teal-400/20 text-sm">
-        <div class="flex gap-2">
-          <button id="btn-login" class="flex-1 px-3 py-2 rounded-xl bg-teal-500/15 border border-teal-400/30 text-sm text-teal-200">🔑 登入</button>
-          <button id="btn-register" class="flex-1 px-3 py-2 rounded-xl bg-white/5 border border-teal-400/15 text-sm">📝 註冊</button>
+        <label>帳號</label>
+        <input type="text" id="auth-username" placeholder="輸入帳號...">
+        <label>密碼</label>
+        <input type="password" id="auth-password" placeholder="輸入密碼...">
+        <div class="dir-buttons">
+          <button id="btn-login" class="btn dir-btn">🔑 登入</button>
+          <button id="btn-register" class="btn dir-btn">📝 註冊新帳號</button>
         </div>
         <div id="auth-status"></div>
       </div>
-      <div id="account-logged-in" class="hidden mt-2 space-y-2">
-        <p class="caption">已登入：<b id="account-username" class="text-teal-200"></b></p>
-        <button id="btn-logout" class="w-full px-3 py-2 rounded-xl bg-white/5 border border-teal-400/15 text-sm">🚪 登出</button>
+      <div id="account-logged-in" class="hidden">
+        <p class="caption">已登入：<b id="account-username"></b></p>
+        <button id="btn-logout" class="btn btn-block">🚪 登出</button>
       </div>
     </details>
 
     <!-- 系統維護 -->
-    <details class="expander rounded-xl bg-white/5 border border-teal-400/15 p-3">
-      <summary class="cursor-pointer text-sm font-semibold text-teal-200">⚙️ 系統維護</summary>
-      <button id="btn-update-cache" class="w-full mt-2 px-3 py-2 rounded-xl bg-white/5 border border-teal-400/15 text-sm">🔄 更新全台南站點快取</button>
+    <details class="expander">
+      <summary>⚙️ 系統維護</summary>
+      <button id="btn-update-cache" class="btn btn-block">🔄 更新全台南站點快取</button>
       <div id="cache-status"></div>
     </details>
   </aside>
 
   <!-- ══════════════ 主內容區 ══════════════ -->
-  <main id="main-content" class="flex-1 w-full max-w-md mx-auto px-4 pt-5 pb-10">
+  <main id="main-content">
 
     <!-- ─────────── 查詢頁面 ─────────── -->
     <section id="page-query" class="page">
+      <h2>🚌 台南公車即時時刻查詢</h2>
 
-      <!-- 品牌標頭：呼應截圖裡的「智慧公車 / Smart Transit」卡片 -->
-      <header class="flex items-center gap-3 rounded-2xl bg-[#0b1d17]/80 border border-teal-400/25 shadow-neon px-4 py-3 mb-4">
-        <div class="w-10 h-10 rounded-full bg-teal-400/15 border border-teal-400/40 flex items-center justify-center text-lg animate-pulse">📡</div>
-        <div class="flex-1 min-w-0">
-          <div class="font-display font-bold text-base leading-tight">智慧公車</div>
-          <div class="text-[11px] text-teal-300/80 leading-tight">Smart Transit・即時動態</div>
-        </div>
-        <span class="flex items-center gap-1 text-[11px] text-teal-300 bg-teal-400/10 border border-teal-400/30 rounded-full px-3 py-1">
-          <span class="w-1.5 h-1.5 rounded-full bg-teal-400 animate-pulse"></span>已連線
-        </span>
-      </header>
-
-      <!-- 主頁圖示 -->
-      <div id="mobile-home-grid" class="grid grid-cols-4 gap-3">
+      <!-- 主頁圖示（電腦版、手機版都會顯示） -->
+      <div id="mobile-home-grid">
         <button class="home-tile home-tile-map" data-action="map">
-          <span class="home-tile-icon">🚌</span><span class="text-[11px]">動態公車</span>
+          <span class="home-tile-icon">🚌</span><span>動態公車</span>
         </button>
         <button class="home-tile home-tile-filter" data-action="filter">
-          <span class="home-tile-icon">🔍</span><span class="text-[11px]">路線篩選</span>
+          <span class="home-tile-icon">🔍</span><span>路線篩選</span>
         </button>
         <button class="home-tile home-tile-nearby" data-action="nearby">
-          <span class="home-tile-icon">📍</span><span class="text-[11px]">附近站牌</span>
+          <span class="home-tile-icon">📍</span><span>附近站牌</span>
         </button>
         <button class="home-tile home-tile-chat" data-action="chat">
-          <span class="home-tile-icon">🤖</span><span class="text-[11px]">AI 對話</span>
+          <span class="home-tile-icon">🤖</span><span>AI 對話</span>
         </button>
         <button class="home-tile home-tile-fav" data-action="favorites">
-          <span class="home-tile-icon">⭐</span><span class="text-[11px]">我的最愛</span>
+          <span class="home-tile-icon">⭐</span><span>我的最愛</span>
         </button>
         <button class="home-tile home-tile-yellow" data-action="yellow-bus">
-          <span class="home-tile-icon">🚕</span><span class="text-[11px]">小黃公車</span>
+          <span class="home-tile-icon">🚕</span><span>小黃公車</span>
         </button>
         <button class="home-tile home-tile-adv" data-action="advsearch">
-          <span class="home-tile-icon">🔎</span><span class="text-[11px]">站到站查詢</span>
+          <span class="home-tile-icon">🔎</span><span>站到站查詢</span>
         </button>
         <button class="home-tile home-tile-more" data-action="more">
-          <span class="home-tile-icon">☰</span><span class="text-[11px]">更多設定</span>
+          <span class="home-tile-icon">☰</span><span>更多設定</span>
         </button>
       </div>
 
-      <!-- 子頁面容器 -->
-      <div id="subpage-container" class="hidden mt-4">
-        <button id="btn-back-home" class="w-full mb-4 px-4 py-3 rounded-2xl bg-white/5 border border-teal-400/20 text-sm">← 返回主頁</button>
+      <!-- 子頁面容器：點主頁圖示後才會出現，一律有返回鍵，不會直接接在主頁下面 -->
+      <div id="subpage-container" class="hidden">
+        <button id="btn-back-home" class="btn btn-block">← 返回主頁</button>
 
-        <!-- 子頁：路線篩選／小黃公車（即時查詢）-->
-        <div id="subpage-route" class="subpage hidden space-y-4">
+        <!-- 子頁：路線篩選／附近站牌／小黃公車 共用同一套查詢結果 -->
+        <div id="subpage-route" class="subpage hidden">
 
-          <!-- 小黃公車專用路線選單 -->
-          <div id="yellow-bus-picker" class="hidden rounded-2xl bg-[#0b1d17]/80 border border-amber-400/25 p-4 space-y-2">
-            <h3 id="yellow-bus-anchor" class="font-display font-bold text-amber-300">🚕 小黃公車查詢</h3>
+          <!-- 小黃公車專用路線選單：只有從「小黃公車」圖示進來才會顯示，選了之後跟一般公車查詢流程完全一樣 -->
+          <div id="yellow-bus-picker" class="hidden">
+            <h3 id="yellow-bus-anchor">🚕 小黃公車查詢</h3>
             <p class="caption">小黃公車是用計程車營運的固定路線公車，查詢方式跟一般公車完全一樣。</p>
-            <label class="text-xs text-slate-400 block">選擇小黃公車路線</label>
-            <select id="yellow-bus-select" class="w-full px-3 py-2 rounded-lg bg-[#07130f] border border-amber-400/25 text-sm">
-              <option value="">請選擇路線...</option>
-            </select>
+            <label>選擇小黃公車路線</label>
+            <select id="yellow-bus-select"><option value="">請選擇路線...</option></select>
             <div id="yellow-bus-status" class="caption"></div>
+            <hr>
           </div>
 
-          <!-- 即時到站 hero 卡片：對應截圖的大數字卡（實際內容仍由既有的 timeline 判斷「等候站」渲染，
-               這裡只是把該筆資料在視覺上放大、加上朗讀／提醒摘要按鈕，資料來源與邏輯完全沒有改動）-->
-          <div class="rounded-2xl bg-gradient-to-br from-teal-500/15 to-transparent border border-teal-400/30 shadow-neon p-4">
-            <div class="flex items-center justify-between mb-2">
-              <div class="flex items-center gap-2 text-xs text-teal-300">
-                <span>🚌</span><span>即時到站</span>
+          <div class="query-columns">
+            <!-- 左欄：路線篩選 -->
+            <div class="query-left">
+              <h3 id="filter-anchor">🔍 路線篩選</h3>
+              <p class="caption">點選顏色或數字篩選：</p>
+
+              <div class="filter-grid">
+                <button class="filter-btn" data-f="綠">綠</button>
+                <button class="filter-btn" data-f="橘">橘</button>
+                <button class="filter-btn" data-f="1">1</button>
+                <button class="filter-btn" data-f="2">2</button>
+
+                <button class="filter-btn" data-f="棕">棕</button>
+                <button class="filter-btn" data-f="藍">藍</button>
+                <button class="filter-btn" data-f="3">3</button>
+                <button class="filter-btn" data-f="4">4</button>
+
+                <button class="filter-btn" data-f="紅">紅</button>
+                <button class="filter-btn" data-f="黃">黃</button>
+                <button class="filter-btn" data-f="5">5</button>
+                <button class="filter-btn" data-f="6">6</button>
+
+                <button class="filter-btn" data-f="市區">市區</button>
+                <button class="filter-btn" data-f="高鐵">高鐵</button>
+                <button class="filter-btn" data-f="7">7</button>
+                <button class="filter-btn" data-f="8">8</button>
+
+                <button class="filter-btn" data-f="觀光">觀光</button>
+                <div class="filter-spacer"></div>
+                <button class="filter-btn" data-f="0">0</button>
+                <button class="filter-btn" data-f="9">9</button>
               </div>
-              <div class="flex gap-2">
-                <button id="btn-tts-speak" class="tts-btn w-9 h-9 rounded-full bg-teal-400/15 border border-teal-400/40 flex items-center justify-center">🔊</button>
-                <button id="btn-tts-stop" class="tts-btn-stop w-9 h-9 rounded-full bg-white/5 border border-teal-400/20 flex items-center justify-center">⏹</button>
+              <button id="btn-clear-filter" class="btn btn-block">❌ 清除篩選</button>
+              <div id="filter-status" class="info-box">顯示：全部路線</div>
+              <div id="filter-route-chips"></div>
+
+              <label>選擇路線</label>
+              <select id="route-select"><option value="">請選擇或輸入路線...</option></select>
+
+              <button id="btn-fav-toggle" class="btn btn-block hidden">☆ 加入最愛</button>
+
+              <div id="stop-select-body" class="hidden">
+                <label>等候站</label>
+                <select id="start-select"></select>
+                <label>目的地</label>
+                <select id="end-select"></select>
               </div>
-            </div>
-            <h3 id="status-title" class="font-display font-semibold text-sm text-slate-200 leading-snug"></h3>
 
-            <div class="flex items-center gap-2 mt-3">
-              <button id="btn-dir0" class="btn dir-btn flex-1 px-3 py-2 rounded-xl bg-white/5 border border-teal-400/20 text-xs">➡️ 往</button>
-              <button id="btn-dir1" class="btn dir-btn flex-1 px-3 py-2 rounded-xl bg-white/5 border border-teal-400/20 text-xs">⬅️ 往</button>
-            </div>
-            <div class="flex items-center justify-between mt-2">
-              <button id="btn-refresh-status" class="btn px-3 py-1.5 rounded-lg bg-white/5 border border-teal-400/20 text-xs">🔄 重新整理</button>
-              <span id="route-refresh-countdown" class="caption refresh-countdown"></span>
-            </div>
-
-            <div id="realtime-stale-hint" class="warning-box hidden">⚠️ 尚未更新資料，目前顯示的可能是稍早的結果</div>
-            <div id="ubike-suggestion" class="success-box hidden"></div>
-          </div>
-
-          <!-- 路線選擇 -->
-          <div class="rounded-2xl bg-[#0b1d17]/80 border border-teal-400/20 p-4 space-y-2">
-            <div class="flex items-center gap-2 text-xs text-teal-300 mb-1">
-              <span>🔀</span><span>路線選擇</span>
-            </div>
-            <select id="route-select" class="w-full px-3 py-3 rounded-xl bg-[#07130f] border border-teal-400/25 text-sm font-semibold">
-              <option value="">請選擇或輸入路線...</option>
-            </select>
-            <button id="btn-fav-toggle" class="btn hidden w-full px-3 py-2 rounded-xl bg-amber-400/10 border border-amber-400/30 text-sm text-amber-200">☆ 加入最愛</button>
-          </div>
-
-          <!-- 路線篩選鍵盤 -->
-          <details class="rounded-2xl bg-[#0b1d17]/80 border border-teal-400/20 p-4">
-            <summary class="cursor-pointer text-xs text-teal-300 flex items-center gap-2"><span>🔍</span><span>路線篩選</span></summary>
-            <p class="caption mt-2 mb-2">點選顏色或數字篩選：</p>
-            <div class="filter-grid grid grid-cols-4 gap-2">
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-emerald-500/80" data-f="綠">綠</button>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-orange-500/80" data-f="橘">橘</button>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-white/10" data-f="1">1</button>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-white/10" data-f="2">2</button>
-
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-amber-800/80" data-f="棕">棕</button>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-sky-500/80" data-f="藍">藍</button>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-white/10" data-f="3">3</button>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-white/10" data-f="4">4</button>
-
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-rose-500/80" data-f="紅">紅</button>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-yellow-400/80 text-slate-900" data-f="黃">黃</button>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-white/10" data-f="5">5</button>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-white/10" data-f="6">6</button>
-
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-slate-600/80" data-f="市區">市區</button>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-slate-600/80" data-f="高鐵">高鐵</button>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-white/10" data-f="7">7</button>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-white/10" data-f="8">8</button>
-
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-teal-500/80" data-f="觀光">觀光</button>
-              <div class="filter-spacer"></div>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-white/10" data-f="0">0</button>
-              <button class="filter-btn rounded-xl py-2 text-sm font-semibold bg-white/10" data-f="9">9</button>
-            </div>
-            <button id="btn-clear-filter" class="w-full mt-2 px-3 py-2 rounded-xl bg-white/5 border border-teal-400/15 text-sm">❌ 清除篩選</button>
-            <div id="filter-status" class="info-box">顯示：全部路線</div>
-            <div id="filter-route-chips" class="flex flex-wrap gap-1.5 mt-2"></div>
-          </details>
-
-          <!-- 等候站／目的地 -->
-          <div id="stop-select-body" class="hidden rounded-2xl bg-[#0b1d17]/80 border border-teal-400/20 p-4 space-y-3">
-            <div>
-              <div class="flex items-center gap-2 text-xs text-teal-300 mb-1"><span>📍</span><span>等候站</span></div>
-              <select id="start-select" class="w-full px-3 py-2 rounded-xl bg-[#07130f] border border-teal-400/25 text-sm"></select>
-            </div>
-            <div class="flex justify-center">
-              <span class="w-8 h-8 rounded-full bg-white/5 border border-teal-400/20 flex items-center justify-center text-sm text-teal-300">⇅</span>
-            </div>
-            <div>
-              <div class="flex items-center gap-2 text-xs text-teal-300 mb-1"><span>🏁</span><span>目的地</span></div>
-              <select id="end-select" class="w-full px-3 py-2 rounded-xl bg-[#07130f] border border-teal-400/25 text-sm"></select>
-            </div>
-          </div>
-
-          <!-- 到站前提醒 -->
-          <div id="reminder-add-box" class="hidden rounded-2xl bg-[#0b1d17]/80 border border-teal-400/20 p-4 space-y-3">
-            <label class="flex items-center gap-2 text-xs text-teal-300"><span>⏰</span><span>到站前提醒</span></label>
-            <div class="flex items-center gap-3">
-              <button type="button" id="btn-reminder-minus" class="w-10 h-10 rounded-full bg-white/5 border border-teal-400/25 text-lg flex items-center justify-center">－</button>
-              <div class="flex-1 text-center">
-                <input type="number" id="reminder-minutes" min="1" max="60" value="3"
-                  class="w-full text-center bg-transparent text-3xl font-display font-bold text-teal-200 outline-none">
-                <div class="text-[11px] text-slate-400 -mt-1">分</div>
+              <div id="reminder-add-box" class="hidden">
+                <label>🔔 到站前幾分鐘提醒（會有鈴聲）</label>
+                <div class="dir-buttons">
+                  <input type="number" id="reminder-minutes" min="1" max="60" value="5" style="flex:1;">
+                  <button id="btn-add-reminder" class="btn dir-btn">🔔 加入到站提醒</button>
+                </div>
               </div>
-              <button type="button" id="btn-reminder-plus" class="w-10 h-10 rounded-full bg-white/5 border border-teal-400/25 text-lg flex items-center justify-center">＋</button>
+              <div id="route-hint" class="info-box">請選擇路線</div>
+
+              <button id="btn-show-timetable" class="btn btn-block hidden">📅 查看固定時刻表</button>
+              <div id="timetable-box" class="hidden"></div>
             </div>
-            <div class="grid grid-cols-3 gap-2">
-              <button type="button" class="reminder-preset-btn px-3 py-2 rounded-xl bg-white/5 border border-teal-400/15 text-sm" data-min="1">1 分</button>
-              <button type="button" class="reminder-preset-btn px-3 py-2 rounded-xl bg-white/5 border border-teal-400/15 text-sm" data-min="3">3 分</button>
-              <button type="button" class="reminder-preset-btn px-3 py-2 rounded-xl bg-white/5 border border-teal-400/15 text-sm" data-min="5">5 分</button>
-            </div>
-            <button id="btn-add-reminder" class="btn w-full px-3 py-3 rounded-xl bg-teal-400/90 text-slate-950 font-semibold text-sm">🔔 加入到站提醒</button>
-          </div>
-          <div id="route-hint" class="info-box">請選擇路線</div>
 
-          <button id="btn-show-timetable" class="btn hidden w-full px-3 py-2 rounded-xl bg-white/5 border border-teal-400/20 text-sm">📅 查看固定時刻表</button>
-          <div id="timetable-box" class="hidden rounded-2xl bg-[#0b1d17]/80 border border-teal-400/20 p-4"></div>
+            <!-- 右欄：即時動態 -->
+            <div class="query-right">
+              <div id="realtime-stale-hint" class="warning-box hidden">⚠️ 尚未更新資料，目前顯示的可能是稍早的結果</div>
+              <div id="weather-box" class="info-box hidden"></div>
 
-          <!-- 天氣 -->
-          <div id="weather-box" class="info-box hidden"></div>
-
-          <!-- 沿線各站動態 -->
-          <div id="status-box" class="hidden rounded-2xl bg-[#0b1d17]/80 border border-teal-400/20 p-4">
-            <div class="flex items-center justify-between mb-1">
-              <div class="flex items-center gap-2 text-sm font-display font-semibold text-teal-200">
-                <span>📶</span><span>沿線各站動態</span>
+              <div id="status-box" class="hidden">
+                <h3 id="status-title"></h3>
+                <div class="dir-buttons">
+                  <button id="btn-dir0" class="btn dir-btn">➡️ 往</button>
+                  <button id="btn-dir1" class="btn dir-btn">⬅️ 往</button>
+                  <button id="btn-refresh-status" class="btn">🔄 重新整理</button>
+                  <span id="route-refresh-countdown" class="caption refresh-countdown"></span>
+                </div>
+                <div id="ubike-suggestion" class="success-box hidden"></div>
+                <div id="timeline-container" class="timeline-container"></div>
+                <div class="tts-buttons">
+                  <button id="btn-tts-speak" class="btn tts-btn">🔊 朗讀公車資訊</button>
+                  <button id="btn-tts-stop" class="btn tts-btn-stop">⏹ 停止</button>
+                </div>
               </div>
-              <span class="flex items-center gap-1 text-[11px] text-teal-300">
-                <span class="w-1.5 h-1.5 rounded-full bg-teal-400 animate-pulse"></span>即時更新
-              </span>
+              <div id="status-empty" class="info-box">👈 請從左側選擇路線開始查詢</div>
             </div>
-            <div id="timeline-container" class="timeline-container"></div>
           </div>
-          <div id="status-empty" class="info-box">👈 請從上方選擇路線開始查詢</div>
         </div>
 
         <!-- 子頁：AI 助理 -->
         <div id="subpage-chat" class="subpage hidden">
-          <div class="rounded-2xl bg-[#0b1d17]/80 border border-violet-400/25 p-4 flex flex-col" style="min-height:65vh;">
-            <h3 id="chat-anchor" class="font-display font-bold text-violet-300 mb-1">🤖 AI 助理</h3>
-            <div class="caption mb-2">目前對話：<b id="chat-current-title" class="text-slate-300"></b></div>
-            <div id="chat-messages" class="flex-1 overflow-y-auto space-y-1 pr-1"></div>
-            <div class="chat-input-row flex gap-2 mt-3">
-              <input type="text" id="chat-input" placeholder="有什麼我可以幫忙的嗎？" class="flex-1 px-3 py-2 rounded-xl bg-[#07130f] border border-violet-400/25 text-sm">
-              <button id="btn-chat-send" class="btn px-4 py-2 rounded-xl bg-violet-500/80 text-sm font-semibold">送出</button>
+          <div class="query-ai-section">
+            <h3 id="chat-anchor">🤖 AI 助理</h3>
+            <div class="caption">目前對話：<b id="chat-current-title"></b></div>
+            <div id="chat-messages"></div>
+            <div class="chat-input-row">
+              <input type="text" id="chat-input" placeholder="有什麼我可以幫忙的嗎？">
+              <button id="btn-chat-send" class="btn">送出</button>
             </div>
           </div>
         </div>
 
-        <!-- 子頁：附近公車站 -->
+        <!-- 子頁：附近公車站（獨立頁面，跟即時查詢頁分開） -->
         <div id="subpage-nearby" class="subpage hidden">
-          <div class="rounded-2xl bg-[#0b1d17]/80 border border-amber-400/25 p-4 space-y-2">
-            <h3 id="nearby-anchor" class="font-display font-bold text-amber-300 mb-1">📍 附近公車站</h3>
-            <button id="btn-gps" class="btn w-full px-3 py-3 rounded-xl bg-amber-400/15 border border-amber-400/35 text-sm">📡 自動取得座標</button>
-            <div class="gps-coords flex items-center gap-2 text-sm">緯度：<input id="lat-disp" readonly placeholder="點上方取得" class="flex-1 px-3 py-2 rounded-lg bg-[#07130f] border border-amber-400/20 text-sm"></div>
-            <div class="gps-coords flex items-center gap-2 text-sm">經度：<input id="lon-disp" readonly placeholder="點上方取得" class="flex-1 px-3 py-2 rounded-lg bg-[#07130f] border border-amber-400/20 text-sm"></div>
-            <label class="text-xs text-slate-400 block">緯度</label>
-            <input type="text" id="gps-lat-in" placeholder="例：22.9997" class="w-full px-3 py-2 rounded-lg bg-[#07130f] border border-amber-400/20 text-sm">
-            <label class="text-xs text-slate-400 block">經度</label>
-            <input type="text" id="gps-lon-in" placeholder="例：120.2270" class="w-full px-3 py-2 rounded-lg bg-[#07130f] border border-amber-400/20 text-sm">
-            <button id="btn-search-nearby" class="btn w-full px-3 py-3 rounded-xl bg-amber-400/90 text-slate-950 font-semibold text-sm">🔍 搜尋附近站牌</button>
+          <div class="query-nearby-section">
+            <h3 id="nearby-anchor">📍 附近公車站</h3>
+            <button id="btn-gps" class="btn btn-block">📡 自動取得座標</button>
+            <div class="gps-coords">
+              緯度：<input id="lat-disp" readonly placeholder="點上方取得">
+            </div>
+            <div class="gps-coords">
+              經度：<input id="lon-disp" readonly placeholder="點上方取得">
+            </div>
+            <label>緯度</label>
+            <input type="text" id="gps-lat-in" placeholder="例：22.9997">
+            <label>經度</label>
+            <input type="text" id="gps-lon-in" placeholder="例：120.2270">
+            <button id="btn-search-nearby" class="btn btn-block">🔍 搜尋附近站牌</button>
             <div id="nearby-result"></div>
           </div>
         </div>
@@ -548,101 +277,46 @@
     </section>
 
     <!-- ─────────── 地圖頁面 ─────────── -->
-    <section id="page-map" class="page hidden fixed inset-0 z-10 bg-[#040b09]">
-      <div id="map-app" class="flex flex-col h-full">
-        <div id="map-panel" class="bg-[#07130f]/95 border-b border-teal-400/20">
-          <div id="map-panel-header" class="flex items-center justify-between px-4 py-3 pt-14">
-            <span class="font-display font-semibold text-sm flex items-center gap-2">🚌 台南公車即時地圖</span>
-            <button id="btn-toggle-map-panel" type="button" class="px-3 py-1.5 rounded-lg border border-teal-400/30 text-xs">☰ 更多設定</button>
+    <section id="page-map" class="page hidden">
+      <div id="map-app">
+        <div id="map-panel">
+          <div id="map-panel-header">
+            <span>🚌 台南公車即時地圖</span>
+            <button id="btn-toggle-map-panel" type="button">☰ 更多設定</button>
           </div>
-          <div id="map-panel-body" class="px-4 pb-3 space-y-2">
-            <div id="map-panel-controls" class="space-y-2">
-              <input id="map-route-input" type="text" placeholder="篩選路線（留空或輸入「全部」＝顯示全部路線），例：藍幹線, 綠1"
-                class="w-full px-3 py-2 rounded-xl bg-[#0b1d17] border border-teal-400/25 text-sm">
-              <div class="caption">💡 可輸入多條路線（用逗號分隔），或直接點下面路線清單裡的項目累加選取</div>
-              <div class="map-btn-row flex items-center gap-2">
-                <button id="btn-map-refresh" class="btn px-3 py-2 rounded-xl bg-teal-400/15 border border-teal-400/35 text-xs">🔄 更新</button>
-                <button id="btn-map-home" class="btn px-3 py-2 rounded-xl bg-white/5 border border-teal-400/20 text-xs">🏠 回查詢頁</button>
+          <div id="map-panel-body">
+            <div id="map-panel-controls">
+              <input id="map-route-input" type="text" placeholder="篩選路線（留空或輸入「全部」＝顯示全部路線），例：藍幹線, 綠1">
+              <div class="caption" style="margin:-4px 0 6px;">💡 可輸入多條路線（用逗號分隔），或直接點下面路線清單裡的項目累加選取</div>
+              <div class="map-btn-row">
+                <button id="btn-map-refresh" class="btn">🔄 更新</button>
+                <button id="btn-map-home" class="btn">🏠 回查詢頁</button>
                 <span id="map-refresh-countdown" class="caption refresh-countdown"></span>
               </div>
-              <button id="btn-map-locate" class="btn w-full px-3 py-2 rounded-xl bg-white/5 border border-teal-400/20 text-sm">📍 定位我的位置</button>
+              <button id="btn-map-locate" class="btn btn-block">📍 定位我的位置</button>
               <div id="map-locate-status" class="caption"></div>
               <div id="map-caption" class="caption"></div>
-              <button id="btn-toggle-bus-list" class="btn hidden w-full px-3 py-2 rounded-xl bg-white/5 border border-teal-400/20 text-sm"></button>
-              <div id="map-bus-list" class="hidden space-y-1.5" style="max-height:260px;overflow-y:auto;-webkit-overflow-scrolling:touch;"></div>
-              <hr class="map-panel-divider border-teal-400/10">
-              <label class="map-panel-label text-xs text-teal-300 block">💾 抓取並儲存路線原始資料（Shape＋StopOfRoute）</label>
-              <input id="save-route-input" type="text" placeholder="輸入路線名稱，例：棕幹線" class="w-full px-3 py-2 rounded-xl bg-[#0b1d17] border border-teal-400/25 text-sm">
-              <button id="btn-save-route-coords" class="btn w-full px-3 py-2 rounded-xl bg-white/5 border border-teal-400/20 text-sm">💾 抓取並儲存到檔案</button>
+              <button id="btn-toggle-bus-list" class="btn btn-block hidden"></button>
+              <div id="map-bus-list" class="hidden" style="max-height:260px;overflow-y:auto;-webkit-overflow-scrolling:touch;"></div>
+              <hr class="map-panel-divider">
+              <label class="map-panel-label">💾 抓取並儲存路線原始資料（Shape＋StopOfRoute）</label>
+              <input id="save-route-input" type="text" placeholder="輸入路線名稱，例：棕幹線">
+              <button id="btn-save-route-coords" class="btn btn-block">💾 抓取並儲存到檔案</button>
               <div id="save-route-status" class="caption"></div>
             </div>
-            <div id="map-panel-stats" class="text-sm text-teal-200">載入中...</div>
-            <div class="caption">💡 放大地圖至街道等級即可看到各站站名；任何縮放層級皆可點擊圓點查看站名</div>
-            <input id="map-search-box" type="text" placeholder="搜尋路線..." class="w-full px-3 py-2 rounded-xl bg-[#0b1d17] border border-teal-400/25 text-sm">
-            <div id="map-route-list" class="space-y-1.5"></div>
+            <div id="map-panel-stats">載入中...</div>
+            <div class="caption" style="padding: 0 12px 6px;">💡 放大地圖至街道等級即可看到各站站名；任何縮放層級皆可點擊圓點查看站名</div>
+            <input id="map-search-box" type="text" placeholder="搜尋路線...">
+            <div id="map-route-list"></div>
           </div>
         </div>
-        <div id="leaflet-map" class="flex-1 min-h-0"></div>
+        <div id="leaflet-map"></div>
       </div>
     </section>
 
   </main>
 </div>
 
-<script src="{{ url_for('static', filename='js/app.js') }}"></script>
-
-<!-- 這一段是為了讓截圖裡的「⇅ 交換等候站／目的地」跟「到站前提醒 -／＋／預設按鈕」有實際作用而
-     額外加的一小段輔助腳本，純粹是操作既有的 <select>／<input> 元素本身，完全沒有改到 app.js
-     的查詢邏輯；換句話說，就算拿掉這一小段，原本 app.js 的功能也不會受影響，只是少了這幾個
-     裝飾性的互動捷徑。 -->
-<script>
-(function () {
-  function byId(id) { return document.getElementById(id); }
-
-  // 交換「等候站」與「目的地」
-  var swapBtn = document.querySelector('#stop-select-body .justify-center span');
-  if (swapBtn) {
-    swapBtn.style.cursor = 'pointer';
-    swapBtn.addEventListener('click', function () {
-      var s = byId('start-select'), e = byId('end-select');
-      if (!s || !e) return;
-      var tmp = s.value; s.value = e.value; e.value = tmp;
-      s.dispatchEvent(new Event('change'));
-      e.dispatchEvent(new Event('change'));
-    });
-  }
-
-  // 到站前提醒：－／＋ 與 1分/3分/5分 快速按鈕
-  var minutesInput = byId('reminder-minutes');
-  function clampMinutes(v) { return Math.min(60, Math.max(1, v)); }
-  function setPresetActive() {
-    document.querySelectorAll('.reminder-preset-btn').forEach(function (b) {
-      var on = String(clampMinutes(parseInt(minutesInput.value, 10) || 0)) === b.dataset.min;
-      b.classList.toggle('bg-teal-400/25', on);
-      b.classList.toggle('border-teal-400/60', on);
-      b.classList.toggle('text-teal-200', on);
-    });
-  }
-  var minusBtn = byId('btn-reminder-minus'), plusBtn = byId('btn-reminder-plus');
-  if (minusBtn) minusBtn.addEventListener('click', function () {
-    minutesInput.value = clampMinutes((parseInt(minutesInput.value, 10) || 1) - 1);
-    setPresetActive();
-  });
-  if (plusBtn) plusBtn.addEventListener('click', function () {
-    minutesInput.value = clampMinutes((parseInt(minutesInput.value, 10) || 1) + 1);
-    setPresetActive();
-  });
-  document.querySelectorAll('.reminder-preset-btn').forEach(function (b) {
-    b.addEventListener('click', function () {
-      minutesInput.value = b.dataset.min;
-      setPresetActive();
-    });
-  });
-  if (minutesInput) {
-    minutesInput.addEventListener('input', setPresetActive);
-    setPresetActive();
-  }
-})();
-</script>
+<script src="{{ static_url('js/app.js') }}"></script>
 </body>
 </html>
