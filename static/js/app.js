@@ -146,7 +146,10 @@ function bindStaticEvents() {
   el('end-select').addEventListener('change', () => loadRouteStatus());
   el('btn-dir0').addEventListener('click', () => setDirection('去程'));
   el('btn-dir1').addEventListener('click', () => setDirection('回程'));
-  el('btn-refresh-status').addEventListener('click', () => loadRouteStatus());
+  el('btn-refresh-status').addEventListener('click', () => {
+    loadRouteStatus();
+    startRouteStatusAutoRefresh();
+  });
 
   el('btn-gps').addEventListener('click', gpsLocate);
   el('btn-search-nearby').addEventListener('click', searchNearby);
@@ -185,7 +188,10 @@ function bindStaticEvents() {
   });
   el('btn-tts-stop').addEventListener('click', () => window.speechSynthesis.cancel());
 
-  el('btn-map-refresh').addEventListener('click', () => loadMapData(true));
+  el('btn-map-refresh').addEventListener('click', () => {
+    loadMapData(true);
+    startMapAutoRefresh();
+  });
   el('map-route-input').addEventListener('keydown', e => { if (e.key === 'Enter') loadMapData(true); });
   el('adv-stop-search').addEventListener('input', e => renderAdvStopOptions(e.target.value));
   el('btn-toggle-map-panel').addEventListener('click', () => {
@@ -231,29 +237,51 @@ function showHome() {
 // fetch_bus_realtime_positions），所以前端可以放心地每 15 秒自動重新整理一次
 // 畫面，不會因此增加對 TDX 的查詢量——15 秒只是「更常去讀後台已經準備好的
 // 那份檔案」，不是「更常去問 TDX」。
-const AUTO_REFRESH_MS = 15000;
+const AUTO_REFRESH_SECONDS = 15;
 
 function startRouteStatusAutoRefresh() {
   stopRouteStatusAutoRefresh();
+  let secondsLeft = AUTO_REFRESH_SECONDS;
+  const countdownEl = el('route-refresh-countdown');
+  if (countdownEl) countdownEl.textContent = `⏱️ ${secondsLeft}s 後自動更新`;
   state.routeStatusPollTimer = setInterval(() => {
-    if (state.routeChoice) loadRouteStatus();
-  }, AUTO_REFRESH_MS);
+    secondsLeft -= 1;
+    if (secondsLeft <= 0) {
+      if (state.routeChoice) loadRouteStatus();
+      secondsLeft = AUTO_REFRESH_SECONDS;
+    }
+    if (countdownEl) countdownEl.textContent = `⏱️ ${secondsLeft}s 後自動更新`;
+  }, 1000);
 }
 function stopRouteStatusAutoRefresh() {
   if (state.routeStatusPollTimer) {
     clearInterval(state.routeStatusPollTimer);
     state.routeStatusPollTimer = null;
   }
+  const countdownEl = el('route-refresh-countdown');
+  if (countdownEl) countdownEl.textContent = '';
 }
 function startMapAutoRefresh() {
   stopMapAutoRefresh();
-  state.mapPollTimer = setInterval(() => loadMapData(), AUTO_REFRESH_MS);
+  let secondsLeft = AUTO_REFRESH_SECONDS;
+  const countdownEl = el('map-refresh-countdown');
+  if (countdownEl) countdownEl.textContent = `⏱️ ${secondsLeft}s 後自動更新`;
+  state.mapPollTimer = setInterval(() => {
+    secondsLeft -= 1;
+    if (secondsLeft <= 0) {
+      loadMapData();
+      secondsLeft = AUTO_REFRESH_SECONDS;
+    }
+    if (countdownEl) countdownEl.textContent = `⏱️ ${secondsLeft}s 後自動更新`;
+  }, 1000);
 }
 function stopMapAutoRefresh() {
   if (state.mapPollTimer) {
     clearInterval(state.mapPollTimer);
     state.mapPollTimer = null;
   }
+  const countdownEl = el('map-refresh-countdown');
+  if (countdownEl) countdownEl.textContent = '';
 }
 
 function showSubpage(id, anchorId) {
