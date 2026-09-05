@@ -7,7 +7,7 @@ import concurrent.futures
 from datetime import datetime, timedelta
 
 import requests
-from flask import Flask, render_template, request, jsonify, session
+from flask import Flask, render_template, request, jsonify, session, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
 
@@ -67,6 +67,23 @@ def create_app():
     app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 3600
     return app
 app = create_app()
+
+
+@app.template_global()
+def static_url(filename):
+    """比照 {{ url_for('static', filename=...) }}，但網址後面多帶一個 ?v=檔案的
+    最後修改時間。前面為了效能把靜態檔案（CSS/JS）設定成瀏覽器快取 1 小時
+    （SEND_FILE_MAX_AGE_DEFAULT），這其實是這幾次『明明改了程式碼、畫面卻看
+    起來沒變』的真正原因——瀏覽器還在用快取裡那份 1 小時內的舊檔案，不是
+    程式碼沒改到。改用這個函式產生網址後，只要檔案內容一變，?v= 後面的數字
+    就會跟著變，等於是新的網址，瀏覽器會直接抓新檔案，不用再手動清快取，
+    也不用犧牲掉長效快取帶來的效能好處。"""
+    fp = os.path.join(app.static_folder or "static", filename)
+    try:
+        v = int(os.path.getmtime(fp))
+    except OSError:
+        v = 0
+    return f"{url_for('static', filename=filename)}?v={v}"
 
 # ── 回應壓縮（gzip）──────────────────────────────────────────
 # 路線軌跡（Shape）、站牌清單這類 JSON 常常一次好幾百 KB，開 gzip 壓縮後
