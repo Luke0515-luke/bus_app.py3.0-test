@@ -1714,6 +1714,8 @@ def api_route_status():
     tts_lines = [f"路線 {route}，往 {dest_0 if direction == '去程' else dest_1}方向。"]
     stops_out = []
     seen_plates = set()  # 用來讓同一輛實體公車只在最接近的站顯示一次（依目前位置單一顯示）
+    last_anchor = None  # (stop_index, eta_seconds)：最近一個「有真實資料佐證」的定錨點，
+                         # 用來推算後面沒有 TDX 資料的站，見下面迴圈內的說明。
     main_dest = dest_0 if direction == "去程" else dest_1
     # 即時動態／GPS 都查不到資料時的最後備援：用固定時刻表概估到站時間（例如「尚未發車」
     # 但其實時刻表上等一下就有一班車），這裡只查一次，下面逐站比對時重複使用。
@@ -1748,15 +1750,30 @@ def api_route_status():
                 plate = gps_bus.get("PlateNumb", "")
             time_text, badge_class = "進站中", "ts-red"
 
-        # 即時動態、GPS 都完全查不到資料（TDX 這站給的是「尚未發車」，完全沒有任何
-        # 到站線索）→ 最後才退回用固定時刻表概估（僅供參考），避免像「新營站其實
-        # 再 44 分鐘有車」卻一直顯示「尚未發車」什麼資訊都沒有。
-        # 這裡刻意只在 status == 1（尚未發車、真的什麼資訊都沒收到）才觸發，
-        # status == 0（營運中，只是暫時沒有預估時間）代表 TDX 其實已經確認有在營運，
-        # 這種「有收到資訊、只是沒有精確時間」的情況不應該被時刻表的猜測蓋過去，
-        # 不然會變成幾乎每一站都顯示成時刻表估計，反而讓真正的即時狀態看不出來。
+        # 即時動態、GPS 都完全查不到這一站的資料時，分兩種情況處理：
+        # ① 這條路線這個方向「後面已經有確認在跑的車」（前面某一站有真的 TDX eta，
+        #    或 GPS 定位確認進站中）→ 用那個真實定錨點往下推算：每站約 2 分鐘，
+        #    樣式（顏色、文字格式）直接沿用 eta_status_text()，跟真的 TDX 資料
+        #    長得一模一樣，不特別標示成估計——因為這是根據已經確認在跑的車推算，
+        #    可信度遠比單純查時刻表高，沒必要讓使用者覺得「這站資料比較不可靠」。
+        # ② 整條路線這個方向到目前為止都還沒有任何真的在跑的車可以當基準
+        #    （沒有定錨點）→ 才退回用固定時刻表概估（僅供參考，這種情況才需要
+        #    清楚標示「時刻表估計」，因為這只是查時刻表猜的，不是根據真的車在推算）。
+        # 兩種都只在 status 是 0（營運中，只是沒給預估時間）或 1（尚未發車）才適用，
+        # status 2/3/4（交管不停靠／末班車已過／今日停駛）代表這站明確不會有車，
+        # 不能因為想補資料就蓋掉這個明確的狀態。
         est_from_schedule = None
-        if eta is None and not gps_here and status == 1:
+        is_calculated_estimate = False
+        if eta is not None:
+            last_anchor = (idx, eta)
+        elif gps_here:
+            last_anchor = (idx, 0)
+        elif status in (0, 1) and last_anchor is not None:
+            anchor_idx, anchor_eta = last_anchor
+            calc_eta = anchor_eta + (idx - anchor_idx) * 120
+            time_text, badge_class = eta_status_text(calc_eta, status)
+            is_calculated_estimate = True
+        elif status == 1:
             est_from_schedule = estimate_eta_from_schedule(schedule_dep_times, idx)
             if est_from_schedule is not None:
                 mins = int(est_from_schedule // 60)
@@ -1792,6 +1809,9 @@ def api_route_status():
                 seen_plates.add(plate)
                 show_bus_tag = True
 
+        # 車型／無障礙／經過路線（支線、繞道）這些都是「這一輛車」的資訊，只要
+        # 車輛標籤本身只在最近站顯示一次，這些附屬資訊也應該只跟著出現那一次，
+        # 不然同一班繞道公車經過的每一站都會重複顯示同樣的「🔀 往 X」，變得很雜。
         stops_out.append({
             "name": s_name,
             "eta_text": time_text,
@@ -1803,8 +1823,9 @@ def api_route_status():
             "has_bus": show_bus_tag,
             "ubikes": ubikes_near,
             "is_waiting_stop": bool(start_st and s_name == start_st),
-            "branch": branch_label,
+            "branch": branch_label if show_bus_tag else "",
             "is_schedule_estimate": est_from_schedule is not None,
+            "is_calculated_estimate": is_calculated_estimate,
         })
 
         if start_st and s_name == start_st:
