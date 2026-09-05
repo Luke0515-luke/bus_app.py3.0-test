@@ -1296,6 +1296,7 @@ def _realtime_poll_loop():
 _load_realtime_cache_from_disk()
 realtime_thread = threading.Thread(target=_realtime_poll_loop, daemon=True)
 realtime_thread.start()
+start_realtime_watchdog(REALTIME_DATA_DIR)
 
 
 def find_nearby_stops(all_stops, lat, lon, radius_km=0.5):
