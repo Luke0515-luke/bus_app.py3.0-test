@@ -589,7 +589,7 @@
   </main>
 </div>
 
-<script src="{{ static_url('js/app.js') }}"></script>
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
 
 <!-- 這一段是為了讓截圖裡的「⇅ 交換等候站／目的地」跟「到站前提醒 -／＋／預設按鈕」有實際作用而
      額外加的一小段輔助腳本，純粹是操作既有的 <select>／<input> 元素本身，完全沒有改到 app.js
