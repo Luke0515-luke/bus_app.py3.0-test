@@ -190,7 +190,6 @@ function bindStaticEvents() {
 
   el('btn-map-refresh').addEventListener('click', () => {
     loadMapData(true);
-    startMapAutoRefresh();
   });
   el('map-route-input').addEventListener('keydown', e => { if (e.key === 'Enter') loadMapData(true); });
   el('adv-stop-search').addEventListener('input', e => renderAdvStopOptions(e.target.value));
@@ -398,7 +397,8 @@ function switchPage(page) {
   document.body.classList.remove('sidebar-open');
   if (page === 'map') {
     initMapPageIfNeeded();
-    startMapAutoRefresh();
+    // 不在這裡馬上開始倒數：這時候通常還沒選路線、地圖上還沒畫出任何公車定位，
+    // 交給 loadMapData() 在真的查到資料、畫出定位之後才開始倒數（見該函式內）。
   } else {
     stopMapAutoRefresh();
   }
@@ -1206,8 +1206,11 @@ async function loadMapData(forceRefresh) {
   // 沒有輸入特定路線、也還沒按過「全部路線」的話，不要打去後端抓「全部路線」的重資料
   // （公車動態＋軌跡＋站牌一次抓全台南所有路線很吃 TDX 額度），維持空白地圖就好，
   // 一定要使用者明確選了東西（打字篩選、勾路線、或按「全部路線」）才真的去抓。
+  // 這種情況下畫面上根本還沒有任何公車定位可以看，也不需要每 15 秒空轉一次，
+  // 所以順便把自動更新倒數關掉，等真的選了路線、畫出定位之後才會重新開始倒數。
   if (!inputVal && !state.mapShowAll) {
     stats.textContent = '請點選路線，或按下方「全部路線」載入公車動態與軌跡';
+    stopMapAutoRefresh();
     return;
   }
   stats.textContent = '載入中...';
@@ -1225,6 +1228,10 @@ async function loadMapData(forceRefresh) {
     drawMapStops();
     drawMapBuses();
     renderMapPanel(el('map-search-box').value);
+    // 畫面上真的有畫出公車定位（或至少成功查了一次、只是剛好目前沒有車在跑）之後，
+    // 才開始 15 秒倒數自動更新——不然使用者一打開地圖頁、都還沒選路線，倒數就先
+    // 空轉跑掉，選了路線之後反而搭不上下一次真正有意義的更新，感覺像「一直跑不出來」。
+    startMapAutoRefresh();
   } catch (e) {
     stats.textContent = '載入失敗';
   }
