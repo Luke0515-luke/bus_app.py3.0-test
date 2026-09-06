@@ -102,18 +102,10 @@ document.addEventListener('DOMContentLoaded', () => {
   loadAdvancedStops();
   loadAuthStatus();
   loadReminders();
+  renderHomeDate();
   loadHomeWeather();
+  setInterval(loadHomeWeather, 10 * 60 * 1000); // 天氣後端本身快取 10 分鐘，前端跟著每 10 分鐘刷新一次就好
 });
-
-async function loadHomeWeather() {
-  try {
-    const data = await api('/api/weather');
-    if (data.weather) {
-      el('home-weather-text').textContent = data.weather;
-      el('home-weather-chip').classList.remove('hidden');
-    }
-  } catch (e) { /* 首頁天氣讀不到就不顯示，不影響其他功能 */ }
-}
 
 function bindStaticEvents() {
   el('btn-font-toggle').addEventListener('click', toggleFont);
@@ -190,14 +182,10 @@ function bindStaticEvents() {
   el('btn-chat-send').addEventListener('click', sendChat);
   el('chat-input').addEventListener('keydown', e => { if (e.key === 'Enter') sendChat(); });
 
-  el('btn-tts-speak').addEventListener('click', () => {
-    if (!state.ttsText) return;
-    const u = new SpeechSynthesisUtterance(state.ttsText);
-    u.lang = 'zh-TW'; u.rate = 0.9;
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(u);
-  });
+  el('btn-tts-speak').addEventListener('click', speakTtsText);
   el('btn-tts-stop').addEventListener('click', () => window.speechSynthesis.cancel());
+  const homeTtsBtn = el('btn-home-tts');
+  if (homeTtsBtn) homeTtsBtn.addEventListener('click', speakTtsText);
 
   el('btn-map-refresh').addEventListener('click', () => loadMapData(true));
   el('map-route-input').addEventListener('keydown', e => { if (e.key === 'Enter') loadMapData(true); });
@@ -530,6 +518,15 @@ async function reloadStopSelectorsForDirection() {
   loadRouteStatus();
 }
 
+// 朗讀目前查詢到的公車動態文字，首頁儀表板的喇叭按鈕跟原本查詢頁的喇叭按鈕共用這支
+function speakTtsText() {
+  if (!state.ttsText) return;
+  const u = new SpeechSynthesisUtterance(state.ttsText);
+  u.lang = 'zh-TW'; u.rate = 0.9;
+  window.speechSynthesis.cancel();
+  window.speechSynthesis.speak(u);
+}
+
 async function loadRouteStatus() {
   if (!state.routeChoice) return;
   const startSt = el('start-select').value;
@@ -545,6 +542,18 @@ async function loadRouteStatus() {
     el('status-box').classList.add('hidden');
     el('status-empty').textContent = '無法取得即時動態。';
     el('status-empty').className = 'error-box';
+    el('status-empty').classList.remove('hidden');
+    return;
+  }
+
+  // 深夜收班時段：後端完全沒有查 TDX，直接顯示收班訊息，不畫時間軸、
+  // 也不要讓「即時倒數」拿舊資料繼續空轉。
+  if (data.service_closed) {
+    stopEtaTicker();
+    el('status-box').classList.add('hidden');
+    el('weather-box').classList.add('hidden');
+    el('status-empty').textContent = data.closed_message || '🌙 末班車已收車';
+    el('status-empty').className = 'warning-box';
     el('status-empty').classList.remove('hidden');
     return;
   }
@@ -571,6 +580,11 @@ async function loadRouteStatus() {
     ubBox.classList.add('hidden');
   }
 
+  // 支線／繞道摘要：整條路線目前查得到的支線車輛，收進一個「展開箭頭」面板，
+  // 不用使用者自己在時間軸裡一站一站找哪裡有標示支線。
+  renderBranchPanel(data.branches || []);
+
+  const fetchedAt = data.eta_fetched_at; // epoch 秒：後端這批到站資料是什麼時候抓到的
   const container = el('timeline-container');
   container.innerHTML = data.stops.map(s => {
     let busHtml = '';
@@ -585,6 +599,12 @@ async function loadRouteStatus() {
     const branchHtml = s.branch ? `<span class="branch-tag">🔀 往 ${esc(s.branch)}</span>` : '';
     const ubikeHtml = (s.ubikes || []).map(u =>
       `<span class="ubike-tag">🚲 可借:${u.available} 可還:${u.empty}</span>`).join('');
+    // 只有「有實際數字秒數」的 badge 才需要前端即時倒數（真的到站預估／推算／時刻表估計），
+    // 「尚未發車」「交管不停靠」這類純文字狀態沒有數字可以倒數，維持原樣就好。
+    const suffix = s.is_schedule_estimate ? '（時刻表估計）' : '';
+    const tickAttrs = (s.eta_seconds !== null && s.eta_seconds !== undefined && fetchedAt)
+      ? ` data-eta-seconds="${s.eta_seconds}" data-fetched-at="${fetchedAt}" data-eta-suffix="${esc(suffix)}"`
+      : '';
     return `
 <div class="timeline-item ${s.is_waiting_stop ? 'waiting-stop' : ''}">
   <div class="timeline-circle"></div>
@@ -596,13 +616,62 @@ async function loadRouteStatus() {
       </div>
       ${ubikeHtml ? `<div class="station-info-ubike">${ubikeHtml}</div>` : ''}
     </div>
-    <span class="time-badge ${s.badge_class}">${esc(s.eta_text)}</span>
+    <span class="time-badge ${s.badge_class}"${tickAttrs}>${esc(s.eta_text)}</span>
   </div>
 </div>`;
   }).join('');
 
   state.ttsText = data.tts_text || '';
   el('status-box').classList.remove('hidden');
+  startEtaTicker();
+}
+
+// ── 支線／繞道摘要面板（展開箭頭）──────────────────────────
+function renderBranchPanel(branches) {
+  const panel = el('branch-panel');
+  if (!panel) return;
+  if (!branches.length) {
+    panel.classList.add('hidden');
+    return;
+  }
+  panel.classList.remove('hidden');
+  el('branch-panel-count').textContent = branches.length;
+  el('branch-panel-body').innerHTML = branches.map(b => `
+    <div class="stop-item">
+      <b>${esc(b.stop)}</b> － 🚌 ${esc(b.plate)} 🔀 往 <b>${esc(b.to)}</b>
+    </div>`).join('');
+}
+
+// ── 到站時間前端即時倒數（Client-side Countdown Interpolation）──────
+// 後端每次抓資料的頻率被拉長了（尖峰 6 分鐘、離峰 15 分鐘一次），畫面上的
+// 數字如果就這樣呆板地卡著不動，使用者會覺得資料是死的。這裡用 setInterval
+// 每秒依照「現在時間 － 後端抓資料的時間戳」自己往下遞減，直到下一次背景
+// 排程抓回新資料、loadRouteStatus() 重新整個畫面時，才會被新的真實數字覆蓋。
+let etaTickTimer = null;
+function startEtaTicker() {
+  stopEtaTicker();
+  etaTickTimer = setInterval(tickEtaCountdowns, 1000);
+  tickEtaCountdowns();
+}
+function stopEtaTicker() {
+  if (etaTickTimer) { clearInterval(etaTickTimer); etaTickTimer = null; }
+}
+function tickEtaCountdowns() {
+  const nowSec = Date.now() / 1000;
+  document.querySelectorAll('#timeline-container .time-badge[data-eta-seconds]').forEach(badge => {
+    const baseSeconds = parseFloat(badge.dataset.etaSeconds);
+    const fetchedAt = parseFloat(badge.dataset.fetchedAt);
+    if (isNaN(baseSeconds) || isNaN(fetchedAt)) return;
+    const remaining = Math.max(0, baseSeconds - (nowSec - fetchedAt));
+    const suffix = badge.dataset.etaSuffix || '';
+    if (remaining <= 120) {
+      badge.textContent = `即將進站${suffix}`;
+      badge.className = `time-badge ${suffix ? 'ts-blue' : 'ts-orange'}`;
+    } else {
+      const mins = Math.floor(remaining / 60);
+      badge.textContent = `${mins} 分鐘${suffix}`;
+    }
+  });
 }
 
 // ── GPS 附近站牌 ─────────────────────────────────────────
@@ -902,44 +971,85 @@ function renderReminders() {
   if (!state.reminders.length) {
     section.classList.add('hidden');
     list.innerHTML = '';
-  } else {
-    section.classList.remove('hidden');
-    list.innerHTML = state.reminders.map(r => `
-      <div class="stop-item reminder-item">
-        <div>
-          <b>${esc(r.route)}</b>（往${esc(r.direction)}）－ ${esc(r.stop)}<br>
-          <span class="caption">到站前 ${r.alert_minutes} 分鐘提醒</span>
-        </div>
-        <button class="btn reminder-delete-btn" data-id="${esc(r.id)}">🗑️</button>
-      </div>`).join('');
-    list.querySelectorAll('.reminder-delete-btn').forEach(b => {
-      b.addEventListener('click', async () => {
-        const id = b.dataset.id;
-        try {
-          await api('/api/reminders/delete', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id })
-          });
-        } catch (e) { /* 忽略 */ }
-        state.reminderAlertedIds.delete(id);
-        state.reminders = state.reminders.filter(r => r.id !== id);
-        renderReminders();
-        ensureReminderPolling();
-      });
+    renderHomeReminderChip();
+    return;
+  }
+  section.classList.remove('hidden');
+  list.innerHTML = state.reminders.map(r => `
+    <div class="stop-item reminder-item">
+      <div>
+        <b>${esc(r.route)}</b>（往${esc(r.direction)}）－ ${esc(r.stop)}<br>
+        <span class="caption">到站前 ${r.alert_minutes} 分鐘提醒</span>
+      </div>
+      <button class="btn reminder-delete-btn" data-id="${esc(r.id)}">🗑️</button>
+    </div>`).join('');
+  list.querySelectorAll('.reminder-delete-btn').forEach(b => {
+    b.addEventListener('click', async () => {
+      const id = b.dataset.id;
+      try {
+        await api('/api/reminders/delete', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id })
+        });
+      } catch (e) { /* 忽略 */ }
+      state.reminderAlertedIds.delete(id);
+      state.reminders = state.reminders.filter(r => r.id !== id);
+      renderReminders();
+      ensureReminderPolling();
     });
-  }
+  });
+  renderHomeReminderChip();
+}
 
-  const homeChip = el('home-reminder-chip');
+// ── 手機版首頁「今日行程總覽」：天氣卡＋提醒狀態卡 ──────────────────
+function renderHomeReminderChip() {
+  const chip = el('home-reminder-chip');
+  if (!chip) return;
   if (!state.reminders.length) {
-    homeChip.classList.add('hidden');
-  } else if (state.reminders.length === 1) {
-    const r = state.reminders[0];
-    el('home-reminder-text').textContent = `${r.route}（往${r.direction}）－ ${r.stop}`;
-    homeChip.classList.remove('hidden');
-  } else {
-    el('home-reminder-text').textContent = `目前有 ${state.reminders.length} 個提醒進行中`;
-    homeChip.classList.remove('hidden');
+    chip.classList.add('hidden');
+    return;
   }
+  // 有好幾個提醒的話，先顯示第一個；每 20 秒的 checkReminders() 輪詢會持續更新這裡
+  const r = state.reminders[0];
+  el('home-reminder-route').textContent = `前往 ${r.stop}`;
+  const etaText = r._lastEtaText || '查詢中...';
+  el('home-reminder-eta').textContent = etaText;
+  el('home-reminder-fired').classList.toggle('hidden', !state.reminderAlertedIds.has(r.id));
+  chip.classList.remove('hidden');
+}
+
+function parseWeatherString(w) {
+  // 後端格式類似「晴天☀️，氣溫 28.3°C，風速 5.2 km/h」，這裡拆出描述文字、
+  // emoji 圖示、跟四捨五入後的整數溫度給首頁天氣卡使用。
+  const descPart = (w || '').split('，')[0] || '';
+  const iconMatch = descPart.match(/\p{Extended_Pictographic}/u);
+  const icon = iconMatch ? iconMatch[0] : '🌤️';
+  const desc = descPart.replace(/\p{Extended_Pictographic}/gu, '').trim() || '晴朗舒適';
+  const tempMatch = (w || '').match(/氣溫\s*(-?\d+(?:\.\d+)?)/);
+  const temp = tempMatch ? Math.round(parseFloat(tempMatch[1])) : null;
+  return { desc, icon, temp };
+}
+
+async function loadHomeWeather() {
+  const chip = el('home-weather-chip');
+  if (!chip) return;
+  try {
+    const data = await api('/api/weather');
+    const { desc, icon, temp } = parseWeatherString(data.weather || '');
+    el('home-weather-temp').textContent = temp !== null ? `${temp}°` : '--°';
+    el('home-weather-text').textContent = desc;
+    el('home-weather-icon').textContent = icon;
+    chip.classList.remove('hidden');
+  } catch (e) { /* 首頁天氣卡查詢失敗就先不顯示，不影響其他功能 */ }
+}
+
+function renderHomeDate() {
+  const el2 = el('home-date');
+  if (!el2) return;
+  const now = new Date();
+  el2.textContent = now.toLocaleDateString('zh-TW', {
+    year: 'numeric', month: 'long', day: 'numeric', weekday: 'long'
+  });
 }
 
 async function checkReminders() {
@@ -960,6 +1070,8 @@ async function checkReminders() {
       groups[key].forEach(r => {
         const stopInfo = data.stops.find(s => s.name === r.stop);
         if (!stopInfo) return;
+        r._lastEtaText = stopInfo.eta_text;         // 給首頁「即時到站」卡片顯示用
+        r._lastBadgeClass = stopInfo.badge_class;
         const mins = parseEtaMinutes(stopInfo.eta_text);
         if (mins !== null && mins <= r.alert_minutes) {
           if (!state.reminderAlertedIds.has(r.id)) {
@@ -979,6 +1091,7 @@ async function checkReminders() {
       });
     } catch (e) { /* 這次查詢失敗就跳過，20 秒後下個週期會重試 */ }
   }
+  renderHomeReminderChip();
 }
 
 // ── 系統維護 ─────────────────────────────────────────────
