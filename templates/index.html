@@ -109,15 +109,37 @@
     <section id="page-query" class="page">
       <h2>🚌 台南公車即時時刻查詢</h2>
 
+      <!-- 手機版才顯示的「今日行程總覽」：日期＋天氣卡＋提醒狀態卡（電腦版維持原狀，
+           這幾個元素用 CSS 只在手機版寬度顯示，desktop 不受影響）-->
+      <div id="home-dashboard">
+        <div id="home-date" class="home-date"></div>
+        <h3 class="home-dashboard-title">📋 今日行程總覽</h3>
+      </div>
+
       <!-- 首頁狀態列：天氣＋提醒，只在首頁圖示格上方顯示一次 -->
       <div id="home-status-banner">
         <div id="home-weather-chip" class="home-status-chip home-status-chip-weather hidden">
-          <span class="home-status-chip-icon">🌤️</span>
-          <span id="home-weather-text" class="home-status-chip-text"></span>
+          <div class="home-status-chip-main">
+            <span class="home-status-chip-label">台南市・今日天氣</span>
+            <div class="home-status-chip-value">
+              <span id="home-weather-temp"></span><span id="home-weather-text" class="home-status-chip-text"></span>
+            </div>
+          </div>
+          <span id="home-weather-icon" class="home-status-chip-icon">🌤️</span>
         </div>
         <div id="home-reminder-chip" class="home-status-chip home-status-chip-reminder hidden">
-          <span class="home-status-chip-icon">🔔</span>
-          <span id="home-reminder-text" class="home-status-chip-text"></span>
+          <div class="home-status-chip-top">
+            <span class="home-status-chip-icon home-status-chip-icon-round">🚌</span>
+            <div class="home-status-chip-main">
+              <span class="home-status-chip-label">即時到站</span>
+              <span id="home-reminder-route" class="home-status-chip-value"></span>
+            </div>
+            <button id="btn-home-tts" class="home-status-chip-speaker" aria-label="朗讀">🔊</button>
+          </div>
+          <div class="home-status-chip-bottom">
+            <span id="home-reminder-eta" class="home-reminder-eta"></span>
+            <span id="home-reminder-fired" class="home-reminder-fired-pill hidden">🔔 提醒已響起</span>
+          </div>
         </div>
       </div>
 
@@ -241,6 +263,16 @@
                   <span id="route-refresh-countdown" class="caption refresh-countdown"></span>
                 </div>
                 <div id="ubike-suggestion" class="success-box hidden"></div>
+
+                <!-- 支線／繞道摘要：預設收合，箭頭點開才展開清單 -->
+                <details id="branch-panel" class="branch-panel hidden">
+                  <summary class="branch-panel-summary">
+                    🔀 本路線目前有 <span id="branch-panel-count">0</span> 班支線／繞道車輛
+                    <span class="branch-panel-arrow">▾</span>
+                  </summary>
+                  <div id="branch-panel-body" class="branch-panel-body"></div>
+                </details>
+
                 <div id="timeline-container" class="timeline-container"></div>
                 <div class="tts-buttons">
                   <button id="btn-tts-speak" class="btn tts-btn">🔊 朗讀公車資訊</button>
