@@ -102,7 +102,18 @@ document.addEventListener('DOMContentLoaded', () => {
   loadAdvancedStops();
   loadAuthStatus();
   loadReminders();
+  loadHomeWeather();
 });
+
+async function loadHomeWeather() {
+  try {
+    const data = await api('/api/weather');
+    if (data.weather) {
+      el('home-weather-text').textContent = data.weather;
+      el('home-weather-chip').classList.remove('hidden');
+    }
+  } catch (e) { /* 首頁天氣讀不到就不顯示，不影響其他功能 */ }
+}
 
 function bindStaticEvents() {
   el('btn-font-toggle').addEventListener('click', toggleFont);
@@ -188,9 +199,7 @@ function bindStaticEvents() {
   });
   el('btn-tts-stop').addEventListener('click', () => window.speechSynthesis.cancel());
 
-  el('btn-map-refresh').addEventListener('click', () => {
-    loadMapData(true);
-  });
+  el('btn-map-refresh').addEventListener('click', () => loadMapData(true));
   el('map-route-input').addEventListener('keydown', e => { if (e.key === 'Enter') loadMapData(true); });
   el('adv-stop-search').addEventListener('input', e => renderAdvStopOptions(e.target.value));
   el('btn-toggle-map-panel').addEventListener('click', () => {
@@ -397,8 +406,6 @@ function switchPage(page) {
   document.body.classList.remove('sidebar-open');
   if (page === 'map') {
     initMapPageIfNeeded();
-    // 不在這裡馬上開始倒數：這時候通常還沒選路線、地圖上還沒畫出任何公車定位，
-    // 交給 loadMapData() 在真的查到資料、畫出定位之後才開始倒數（見該函式內）。
   } else {
     stopMapAutoRefresh();
   }
@@ -895,32 +902,44 @@ function renderReminders() {
   if (!state.reminders.length) {
     section.classList.add('hidden');
     list.innerHTML = '';
-    return;
-  }
-  section.classList.remove('hidden');
-  list.innerHTML = state.reminders.map(r => `
-    <div class="stop-item reminder-item">
-      <div>
-        <b>${esc(r.route)}</b>（往${esc(r.direction)}）－ ${esc(r.stop)}<br>
-        <span class="caption">到站前 ${r.alert_minutes} 分鐘提醒</span>
-      </div>
-      <button class="btn reminder-delete-btn" data-id="${esc(r.id)}">🗑️</button>
-    </div>`).join('');
-  list.querySelectorAll('.reminder-delete-btn').forEach(b => {
-    b.addEventListener('click', async () => {
-      const id = b.dataset.id;
-      try {
-        await api('/api/reminders/delete', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id })
-        });
-      } catch (e) { /* 忽略 */ }
-      state.reminderAlertedIds.delete(id);
-      state.reminders = state.reminders.filter(r => r.id !== id);
-      renderReminders();
-      ensureReminderPolling();
+  } else {
+    section.classList.remove('hidden');
+    list.innerHTML = state.reminders.map(r => `
+      <div class="stop-item reminder-item">
+        <div>
+          <b>${esc(r.route)}</b>（往${esc(r.direction)}）－ ${esc(r.stop)}<br>
+          <span class="caption">到站前 ${r.alert_minutes} 分鐘提醒</span>
+        </div>
+        <button class="btn reminder-delete-btn" data-id="${esc(r.id)}">🗑️</button>
+      </div>`).join('');
+    list.querySelectorAll('.reminder-delete-btn').forEach(b => {
+      b.addEventListener('click', async () => {
+        const id = b.dataset.id;
+        try {
+          await api('/api/reminders/delete', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id })
+          });
+        } catch (e) { /* 忽略 */ }
+        state.reminderAlertedIds.delete(id);
+        state.reminders = state.reminders.filter(r => r.id !== id);
+        renderReminders();
+        ensureReminderPolling();
+      });
     });
-  });
+  }
+
+  const homeChip = el('home-reminder-chip');
+  if (!state.reminders.length) {
+    homeChip.classList.add('hidden');
+  } else if (state.reminders.length === 1) {
+    const r = state.reminders[0];
+    el('home-reminder-text').textContent = `${r.route}（往${r.direction}）－ ${r.stop}`;
+    homeChip.classList.remove('hidden');
+  } else {
+    el('home-reminder-text').textContent = `目前有 ${state.reminders.length} 個提醒進行中`;
+    homeChip.classList.remove('hidden');
+  }
 }
 
 async function checkReminders() {
@@ -1206,11 +1225,8 @@ async function loadMapData(forceRefresh) {
   // 沒有輸入特定路線、也還沒按過「全部路線」的話，不要打去後端抓「全部路線」的重資料
   // （公車動態＋軌跡＋站牌一次抓全台南所有路線很吃 TDX 額度），維持空白地圖就好，
   // 一定要使用者明確選了東西（打字篩選、勾路線、或按「全部路線」）才真的去抓。
-  // 這種情況下畫面上根本還沒有任何公車定位可以看，也不需要每 15 秒空轉一次，
-  // 所以順便把自動更新倒數關掉，等真的選了路線、畫出定位之後才會重新開始倒數。
   if (!inputVal && !state.mapShowAll) {
     stats.textContent = '請點選路線，或按下方「全部路線」載入公車動態與軌跡';
-    stopMapAutoRefresh();
     return;
   }
   stats.textContent = '載入中...';
@@ -1228,12 +1244,17 @@ async function loadMapData(forceRefresh) {
     drawMapStops();
     drawMapBuses();
     renderMapPanel(el('map-search-box').value);
-    // 畫面上真的有畫出公車定位（或至少成功查了一次、只是剛好目前沒有車在跑）之後，
-    // 才開始 15 秒倒數自動更新——不然使用者一打開地圖頁、都還沒選路線，倒數就先
-    // 空轉跑掉，選了路線之後反而搭不上下一次真正有意義的更新，感覺像「一直跑不出來」。
-    startMapAutoRefresh();
+    // 只有「畫面上真的有顯示公車定位」才開始跑 15 秒倒數自動更新；
+    // 還沒選路線、或選到的路線目前剛好沒有任何公車在跑，就不要一直倒數
+    // 卻永遠等不到東西可以更新，那樣只會讓人覺得畫面一直在空轉。
+    if (state.mapBusData && state.mapBusData.length > 0) {
+      if (!state.mapPollTimer) startMapAutoRefresh();
+    } else {
+      stopMapAutoRefresh();
+    }
   } catch (e) {
     stats.textContent = '載入失敗';
+    stopMapAutoRefresh();
   }
 }
 
