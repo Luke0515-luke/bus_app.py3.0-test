@@ -109,6 +109,18 @@
     <section id="page-query" class="page">
       <h2>🚌 台南公車即時時刻查詢</h2>
 
+      <!-- 首頁狀態列：天氣＋提醒，只在首頁圖示格上方顯示一次 -->
+      <div id="home-status-banner">
+        <div id="home-weather-chip" class="home-status-chip home-status-chip-weather hidden">
+          <span class="home-status-chip-icon">🌤️</span>
+          <span id="home-weather-text" class="home-status-chip-text"></span>
+        </div>
+        <div id="home-reminder-chip" class="home-status-chip home-status-chip-reminder hidden">
+          <span class="home-status-chip-icon">🔔</span>
+          <span id="home-reminder-text" class="home-status-chip-text"></span>
+        </div>
+      </div>
+
       <!-- 主頁圖示（電腦版、手機版都會顯示） -->
       <div id="mobile-home-grid">
         <button class="home-tile home-tile-map" data-action="map">
