@@ -1,17 +1,15 @@
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&display=swap');
 
 :root {
-  --ink-deep: #070c16;      /* 最深底色 */
-  --ink-panel: #0d1526;     /* 側欄／面板底色 */
-  --ink-elevated: #121d34;  /* 卡片、輸入框底色 */
-  --ink-line: #22314f;      /* 分隔線 */
+  --ink-deep: #04110d;      /* 最深底色（原本深藍黑，改成偏墨綠黑，呼應截圖的霓虹風）*/
+  --ink-panel: #0a1f19;     /* 側欄／面板底色 */
+  --ink-elevated: #0f2921;  /* 卡片、輸入框底色 */
+  --ink-line: #164036;      /* 分隔線 */
   --text-main: #eef1f8;
-  --text-muted: #8a97b8;
-  --signal: #2dd4bf;        /* 主識別色：霓虹青，呼應智慧站牌介面的主色調 */
-  --signal-dim: #0f5c53;
-  --alert: #f59e0b;         /* 提醒／接近中專用的琥珀色，跟主色分開，兩者不會混用 */
-  --alert-dim: #8a5b13;
-  --link-blue: #38bdf8;
+  --text-muted: #92a0c4;
+  --signal: #f5a524;        /* 提醒／警示用的琥珀色，呼應截圖裡「提醒已響起」的金黃色 */
+  --signal-dim: #8a5b13;
+  --link-blue: #2dd4bf;     /* 主識別色改成霓虹青綠 */
   --font-display: 'Space Grotesk', 'Noto Sans TC', -apple-system, sans-serif;
 }
 
@@ -43,7 +41,7 @@ html, body { height: 100%; background: #f5f6fa; color: #222; }
   font-size: 19px; margin-bottom: 14px; padding: 10px 12px;
   color: var(--signal); letter-spacing: .04em;
   background: var(--ink-deep); border: 1px solid var(--signal-dim); border-radius: 8px;
-  text-shadow: 0 0 10px rgba(45,212,191,.45);
+  text-shadow: 0 0 10px rgba(255,176,32,.45);
 }
 #sidebar h3 { font-size: 14px; color: #cfd8ff; margin: 10px 0 6px; }
 #sidebar hr { border: none; border-top: 1px solid var(--ink-line); margin: 14px 0; }
@@ -65,13 +63,13 @@ html, body { height: 100%; background: #f5f6fa; color: #222; }
 /* ── 按鈕 ───────────────────────────────────────────── */
 .btn {
   font-family: var(--font-display);
-  background: var(--ink-elevated); color: #fff; border: 1px solid var(--ink-line); border-radius: 6px;
+  background: #0f3460; color: #fff; border: none; border-radius: 6px;
   padding: 8px 12px; font-size: 13px; font-weight: 500; cursor: pointer; transition: background .15s, transform .05s;
 }
-.btn:hover { background: var(--signal-dim); }
+.btn:hover { background: #1a4a80; }
 .btn:active { transform: scale(.98); }
 .btn-block { width: 100%; margin: 4px 0; text-align: center; }
-.btn.active { background: var(--signal); color: #052e2b; border-color: var(--signal); }
+.btn.active { background: var(--signal); color: #2b1c00; }
 
 /* ── 主內容 ─────────────────────────────────────────── */
 #main-content { flex: 1; padding: 24px 28px; overflow-y: auto; height: 100vh; }
@@ -88,22 +86,6 @@ html, body { height: 100%; background: #f5f6fa; color: #222; }
   display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px;
   max-width: 620px; margin: 10px 0 26px;
 }
-
-/* 首頁狀態列：天氣＋提醒，卡片式呈現，跟主識別色（青）／提醒色（琥珀）對應 */
-#home-status-banner { display: flex; flex-wrap: wrap; gap: 10px; max-width: 620px; margin: 14px 0 4px; }
-.home-status-chip {
-  display: flex; align-items: center; gap: 10px; flex: 1 1 220px;
-  background: var(--ink-panel); border: 1px solid var(--ink-line); border-radius: 12px;
-  padding: 10px 14px; color: var(--text-main); font-size: 13px; font-weight: 500;
-}
-.home-status-chip-icon {
-  display: flex; align-items: center; justify-content: center;
-  width: 32px; height: 32px; border-radius: 50%; font-size: 16px; flex-shrink: 0;
-}
-.home-status-chip-weather .home-status-chip-icon { background: rgba(45,212,191,.15); }
-.home-status-chip-reminder .home-status-chip-icon { background: rgba(245,158,11,.15); }
-.home-status-chip-reminder { border-color: rgba(245,158,11,.35); }
-.home-status-chip-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .home-tile {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 6px; aspect-ratio: 1 / 1; border: none; border-radius: 14px;
@@ -124,6 +106,12 @@ html, body { height: 100%; background: #f5f6fa; color: #222; }
 
 #subpage-container { max-width: 1100px; }
 #btn-back-home { max-width: 220px; margin-bottom: 16px; }
+
+/* 「今日行程總覽」儀表板（日期／天氣卡／提醒狀態卡）：只在手機版顯示，
+   電腦版維持原本沒有這塊的樣子，所以這裡預設隱藏，實際樣式都寫在下面
+   手機版的 @media (max-width: 900px) 裡。 */
+#home-dashboard { display: none; }
+#home-status-banner { display: none; }
 
 /* 小黃公車路線選單（只在從小黃公車圖示進來時顯示） */
 #yellow-bus-picker { background: #fff8e6; border: 1px solid #f1c40f66; border-radius: 8px; padding: 12px 14px; margin-bottom: 16px; }
@@ -180,7 +168,7 @@ html, body { height: 100%; background: #f5f6fa; color: #222; }
 /* 選取中：用白色內圈當作已選取的標示，底色維持該分類顏色，不會被蓋成純藍色 */
 .filter-btn.active { box-shadow: inset 0 0 0 3px rgba(255,255,255,.85); }
 .filter-btn:not([data-f="綠"]):not([data-f="橘"]):not([data-f="棕"]):not([data-f="藍"]):not([data-f="紅"]):not([data-f="黃"]):not([data-f="市區"]):not([data-f="高鐵"]):not([data-f="觀光"]).active {
-  background: var(--signal); color: #052e2b; border-color: var(--signal);
+  background: #4A90E2; color: #fff; border-color: #4A90E2;
 }
 .filter-spacer { visibility: hidden; pointer-events: none; }
 
@@ -201,12 +189,12 @@ html, body { height: 100%; background: #f5f6fa; color: #222; }
 /* ── 時間軸（與原本 CSS 相同）───────────────────────── */
 .timeline-container {
   position: relative; padding-left: 35px; margin-left: 15px;
-  border-left: 4px solid var(--signal); padding-top: 10px; padding-bottom: 10px;
+  border-left: 4px solid #4A90E2; padding-top: 10px; padding-bottom: 10px;
 }
 .timeline-item { position: relative; margin-bottom: 18px; }
 .timeline-circle {
   position: absolute; left: -44px; top: 12px; width: 14px; height: 14px;
-  background-color: white; border: 4px solid var(--signal); border-radius: 50%; z-index: 2;
+  background-color: white; border: 4px solid #4A90E2; border-radius: 50%; z-index: 2;
 }
 .station-box {
   display: flex; justify-content: space-between; align-items: flex-start;
@@ -217,20 +205,38 @@ html, body { height: 100%; background: #f5f6fa; color: #222; }
 .station-info-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .station-info-ubike { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .station-name { font-size: 15px; font-weight: bold; color: #333333; }
-.bus-tag { background-color: #14b8a6; color: white; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; display: inline-flex; align-items: center; }
+.bus-tag { background-color: #FF5A5F; color: white; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; display: inline-flex; align-items: center; }
 .wheelchair-tag { background-color: #2ECC71; color: white; padding: 3px 6px; border-radius: 4px; font-size: 11px; font-weight: bold; display: inline-flex; align-items: center; }
 .no-wheelchair-tag { background-color: #95a5a6; color: white; padding: 3px 6px; border-radius: 4px; font-size: 11px; display: inline-flex; align-items: center; }
 .ev-tag { background-color: #8e44ad; color: white; padding: 3px 6px; border-radius: 4px; font-size: 11px; font-weight: bold; display: inline-flex; align-items: center; }
-.branch-tag { background-color: var(--alert); color: #2b1c00; padding: 3px 6px; border-radius: 4px; font-size: 11px; font-weight: bold; display: inline-flex; align-items: center; }
+.branch-tag { background-color: #f39c12; color: white; padding: 3px 6px; border-radius: 4px; font-size: 11px; font-weight: bold; display: inline-flex; align-items: center; }
 .ubike-tag { background-color: #007bff; color: white; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; display: inline-flex; align-items: center; gap: 4px; }
 .time-badge { padding: 6px 12px; border-radius: 20px; color: white; font-weight: bold; font-size: 12px; min-width: 90px; text-align: center; display: inline-block; }
-.ts-gray   { background-color: #64748b; }
-.ts-orange { background-color: var(--alert); animation: pulse 1s infinite; }
-.ts-green  { background-color: #14b8a6; }
-.ts-blue   { background-color: #38bdf8; }
-.ts-red    { background-color: #f43f5e; }
+.ts-gray   { background-color: #BDBDBD; }
+.ts-orange { background-color: #FFA726; animation: pulse 1s infinite; }
+.ts-green  { background-color: #66BB6A; }
+.ts-blue   { background-color: #5DADE2; }
+.ts-red    { background-color: #E74C3C; }
 @keyframes pulse { 0%{opacity:.8} 50%{opacity:1} 100%{opacity:.8} }
 .waiting-stop .station-box { outline: 2px solid #4A90E2; }
+
+/* ── 支線／繞道摘要（展開箭頭）───────────────────────── */
+.branch-panel {
+  background: #fff6e6; border: 1px solid #f1c40f66; border-radius: 8px;
+  padding: 8px 12px; margin: 10px 0; font-size: 13px;
+}
+.branch-panel-summary {
+  cursor: pointer; font-weight: bold; color: #8a6100; list-style: none;
+  display: flex; align-items: center; gap: 6px;
+}
+.branch-panel-summary::-webkit-details-marker { display: none; }
+.branch-panel-arrow { margin-left: auto; transition: transform .2s ease; }
+.branch-panel[open] .branch-panel-arrow { transform: rotate(180deg); }
+.branch-panel-body { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.branch-panel-body .stop-item { background: #fff; border: 1px solid #f1c40f44; padding: 6px 10px; }
+body.theme-night .branch-panel { background: #2a2210; border-color: #5c4a1166; }
+body.theme-night .branch-panel-summary { color: #f0c869; }
+body.theme-night .branch-panel-body .stop-item { background: #1a1710; border-color: #5c4a1155; color: #eee; }
 
 /* ── 大字體模式 ───────────────────────────────────── */
 body.font-large, body.font-large .btn, body.font-large select, body.font-large input,
@@ -267,37 +273,37 @@ body.font-large .ev-tag, body.font-large .ubike-tag { font-size: 14px !important
 
 /* ── 地圖頁面 ─────────────────────────────────────── */
 #page-map { padding: 0; margin: -24px -28px; }
-#map-app { display: flex; height: 100vh; overflow: hidden; background: var(--ink-deep); }
-#map-panel { width: 240px; min-width: 240px; background: var(--ink-panel); color: #eee; display: flex; flex-direction: column; overflow: hidden; border-right: 1px solid var(--ink-line); }
+#map-app { display: flex; height: 100vh; overflow: hidden; background: #1a1a2e; }
+#map-panel { width: 240px; min-width: 240px; background: #16213e; color: #eee; display: flex; flex-direction: column; overflow: hidden; border-right: 1px solid #0f3460; }
 #map-panel-header {
   padding: 12px; background: var(--ink-deep); font-weight: 700; font-size: 14px;
   color: var(--signal); flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px;
   font-family: var(--font-display); letter-spacing: .03em; border-bottom: 1px solid var(--signal-dim);
-  text-shadow: 0 0 8px rgba(45,212,191,.4);
+  text-shadow: 0 0 8px rgba(255,176,32,.4);
 }
 #btn-toggle-map-panel { display: none; }
 /* 面板內容整個當成同一個可捲動區塊（只有最上面的標題列固定），
    不論是路線清單、公車定位清單、或存檔狀態訊息變多長，都滑得到，不會被裁掉。 */
 #map-panel-body { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; }
-#map-panel-controls { padding: 8px 12px; border-bottom: 1px solid var(--ink-line); }
-#map-panel-controls input { width: 100%; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--ink-line); background: var(--ink-deep); color: #eee; font-size: 12px; margin-bottom: 6px; }
+#map-panel-controls { padding: 8px 12px; border-bottom: 1px solid #0f3460; }
+#map-panel-controls input { width: 100%; padding: 6px 8px; border-radius: 6px; border: 1px solid #0f3460; background: #1a1a2e; color: #eee; font-size: 12px; margin-bottom: 6px; }
 .map-btn-row { display: flex; gap: 6px; }
 .map-btn-row .btn { flex: 1; font-size: 12px; padding: 6px 4px; }
 #map-caption { margin-top: 6px; font-size: 11px; }
 /* 公車最新定位清單自己有高度上限＋內部捲動（跟 #chat-messages 同一種做法），
    這樣就算篩選出十幾台公車，也不會把下面的路線清單一路往下推得老遠。 */
 #map-bus-list { max-height: 260px; overflow-y: auto; -webkit-overflow-scrolling: touch; margin: 6px 0 2px; border-radius: 6px; }
-#map-bus-list .stop-item { padding: 6px 8px; border-bottom: 1px solid var(--ink-line); font-size: 12px; color: #ddd; line-height: 1.7; }
-#map-bus-list .stop-item:hover { background: var(--ink-line); }
+#map-bus-list .stop-item { padding: 6px 8px; border-bottom: 1px solid #0f3460; font-size: 12px; color: #ddd; line-height: 1.7; }
+#map-bus-list .stop-item:hover { background: #0f3460; }
 #map-bus-list .caption { padding: 4px 8px; }
-#map-panel-stats { padding: 8px 12px; font-size: 12px; color: #aaa; border-bottom: 1px solid var(--ink-line); }
-#map-search-box { margin: 8px; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--ink-line); background: var(--ink-deep); color: #eee; font-size: 12px; width: calc(100% - 16px); }
+#map-panel-stats { padding: 8px 12px; font-size: 12px; color: #aaa; border-bottom: 1px solid #0f3460; }
+#map-search-box { margin: 8px; padding: 6px 8px; border-radius: 6px; border: 1px solid #0f3460; background: #1a1a2e; color: #eee; font-size: 12px; width: calc(100% - 16px); }
 #map-route-list { padding: 4px 0; }
-.route-item { display: flex; align-items: center; padding: 6px 12px; cursor: pointer; font-size: 13px; border-bottom: 1px solid var(--ink-line); transition: background 0.15s; }
-.route-item:hover { background: var(--ink-line); }
-.route-item.active { background: rgba(45,212,191,.14); box-shadow: inset 3px 0 0 var(--signal); }
+.route-item { display: flex; align-items: center; padding: 6px 12px; cursor: pointer; font-size: 13px; border-bottom: 1px solid #0f3460; transition: background 0.15s; }
+.route-item:hover { background: #0f3460; }
+.route-item.active { background: rgba(255,176,32,.14); box-shadow: inset 3px 0 0 var(--signal); }
 .route-dot { width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; flex-shrink: 0; border: 2px solid rgba(255,255,255,0.3); box-shadow: 0 0 6px rgba(255,255,255,.35); }
-.route-count { margin-left: auto; font-size: 11px; color: #888; background: var(--ink-line); padding: 1px 5px; border-radius: 8px; }
+.route-count { margin-left: auto; font-size: 11px; color: #888; background: #0f3460; padding: 1px 5px; border-radius: 8px; }
 #leaflet-map { flex: 1; }
 .bus-popup b { font-size: 15px; color: #333; }
 .bus-popup .tag { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 11px; color: white; margin-top: 4px; margin-right: 2px; }
@@ -328,7 +334,7 @@ body.font-large .ev-tag, body.font-large .ubike-tag { font-size: 14px !important
     display: flex; align-items: center; justify-content: center;
     position: fixed; top: 10px; right: 10px; z-index: 1100;
     width: 42px; height: 42px; border-radius: 8px;
-    background: var(--ink-panel); color: #fff; border: none; font-size: 20px;
+    background: #16213e; color: #fff; border: none; font-size: 20px;
     cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,.35);
   }
 
@@ -350,6 +356,52 @@ body.font-large .ev-tag, body.font-large .ubike-tag { font-size: 14px !important
   .sidebar-title { font-size: 18px; text-align: center; }
 
   #main-content { height: auto; padding: 16px; padding-top: 64px; }
+
+  /* ── 手機版「今日行程總覽」儀表板：日期／天氣卡／提醒狀態卡 ─────────
+     照參考截圖的深色霓虹風設計，只在這個手機版寬度區間顯示；電腦版完全
+     沒有這塊、維持原本版面不變。*/
+  #home-dashboard { display: block; margin-top: 4px; }
+  .home-date { font-size: 13px; color: #9aa4c0; margin-bottom: 4px; }
+  .home-dashboard-title { font-size: 22px; font-weight: 800; color: #eef1f8; margin: 0 0 14px; }
+
+  #home-status-banner { display: flex; flex-direction: column; gap: 14px; margin-bottom: 18px; }
+  .home-status-chip {
+    border-radius: 18px; padding: 16px 18px; background: #0e1a16;
+    border: 1px solid rgba(45,212,191,.35);
+    box-shadow: 0 0 0 1px rgba(45,212,191,.08) inset, 0 0 24px -10px rgba(45,212,191,.5);
+  }
+  .home-status-chip-label { display: block; font-size: 12px; color: #7fa89d; margin-bottom: 6px; }
+  .home-status-chip-value { font-size: 15px; color: #eafff9; font-weight: 600; }
+
+  /* 天氣卡 */
+  .home-status-chip-weather { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  #home-weather-temp { font-size: 30px; font-weight: 800; color: #eafff9; margin-right: 6px; font-family: 'Space Grotesk', sans-serif; }
+  .home-status-chip-weather .home-status-chip-text { font-size: 15px; color: #cdeee6; }
+  .home-status-chip-weather .home-status-chip-icon {
+    font-size: 26px; width: 54px; height: 54px; border-radius: 14px; flex-shrink: 0;
+    background: #241d0c; display: flex; align-items: center; justify-content: center;
+  }
+
+  /* 提醒狀態卡：呼應截圖的琥珀色邊框 */
+  .home-status-chip-reminder {
+    border-color: rgba(245,165,36,.5);
+    box-shadow: 0 0 0 1px rgba(245,165,36,.08) inset, 0 0 24px -10px rgba(245,165,36,.6);
+  }
+  .home-status-chip-top { display: flex; align-items: center; gap: 12px; }
+  .home-status-chip-icon-round {
+    width: 44px; height: 44px; border-radius: 999px; background: #241d0c;
+    display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0;
+  }
+  .home-status-chip-speaker {
+    width: 40px; height: 40px; border-radius: 999px; border: 1px solid rgba(45,212,191,.5);
+    background: rgba(45,212,191,.12); color: #5eead4; font-size: 16px; cursor: pointer; flex-shrink: 0;
+  }
+  .home-status-chip-bottom { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; }
+  .home-reminder-eta { font-size: 22px; font-weight: 800; color: #facc15; font-family: 'Space Grotesk', sans-serif; }
+  .home-reminder-fired-pill {
+    font-size: 12px; font-weight: 700; color: #f5a524; background: rgba(245,165,36,.14);
+    border: 1px solid rgba(245,165,36,.5); border-radius: 999px; padding: 6px 12px;
+  }
 
   /* 手機版主頁圖示：跟電腦版同一套 .home-tile 樣式，這裡只調整欄數／間距 */
   #mobile-home-grid {
@@ -380,7 +432,7 @@ body.font-large .ev-tag, body.font-large .ubike-tag { font-size: 14px !important
   /* 地圖頁：側欄改到上方，地圖佔剩餘高度 */
   #page-map { margin: -64px -16px -16px -16px; }
   #map-app { flex-direction: column; height: 100vh; }
-  #map-panel { width: 100%; min-width: 0; border-right: none; border-bottom: 1px solid var(--ink-line); }
+  #map-panel { width: 100%; min-width: 0; border-right: none; border-bottom: 1px solid #0f3460; }
   #map-panel-header { padding-top: 54px; }
   #leaflet-map { flex: 1; min-height: 45vh; }
 
@@ -436,7 +488,16 @@ body.js-mobile #leaflet-map { flex: 1 !important; min-height: 45vh !important; }
 /* ── 小型手機（≤ 480px）─────────────────────────────── */
 @media (max-width: 480px) {
   .sidebar-title { font-size: 16px; }
-  #main-content h2 { font-size: 18px; }
+  #main-content h2 {
+    font-size: 18px; display: flex; align-items: center; gap: 10px;
+    background: #0e1a16; border: 1px solid rgba(45,212,191,.3); border-radius: 16px;
+    padding: 12px 16px; box-shadow: 0 0 20px -10px rgba(45,212,191,.5);
+  }
+  #main-content h2::after {
+    content: '🔊'; margin-left: auto; width: 34px; height: 34px; border-radius: 999px;
+    background: rgba(45,212,191,.14); border: 1px solid rgba(45,212,191,.5);
+    display: flex; align-items: center; justify-content: center; font-size: 15px;
+  }
 
   .filter-grid { grid-template-columns: repeat(4, 1fr); gap: 5px; }
   .filter-btn { padding: 8px 0; font-size: 12px; }
@@ -468,37 +529,37 @@ body.js-mobile #leaflet-map { flex: 1 !important; min-height: 45vh !important; }
    偏白色的卡片／方塊，晚上看起來才不會刺眼。由 app.js 依 Asia/Taipei
    時間自動幫 body 加上 theme-day / theme-night class。 */
 body.theme-day  { background: #f5f6fa; color: #222; }
-body.theme-night { background: var(--ink-deep); color: #eee; }
-body.theme-night #main-content { background: var(--ink-deep); color: #eee; }
+body.theme-night { background: #0b0d12; color: #eee; }
+body.theme-night #main-content { background: #0b0d12; color: #eee; }
 body.theme-night #main-content h2 { color: #eee; }
-body.theme-night .station-box { background: var(--ink-panel); border-color: var(--ink-line); }
+body.theme-night .station-box { background: #171a24; border-color: #262a38; }
 body.theme-night .station-name { color: #eee; }
-body.theme-night .caption { color: var(--text-muted); }
-body.theme-night .info-box { background: rgba(45,212,191,.12); color: #99f6e4; }
+body.theme-night .caption { color: #9aa4c0; }
+body.theme-night .info-box { background: #17233d; color: #cfe0ff; }
 body.theme-night .success-box { background: #123322; color: #7be3a6; }
-body.theme-night .warning-box { background: rgba(245,158,11,.14); color: #fcd34d; }
+body.theme-night .warning-box { background: #3a2f10; color: #f0c869; }
 body.theme-night .error-box { background: #3a1414; color: #ff9a9a; }
-body.theme-night #timetable-box { background: var(--ink-panel); border-color: var(--ink-line); }
-body.theme-night .timetable-dir-title { color: #99f6e4; }
-body.theme-night .timetable-time { background: rgba(45,212,191,.14); color: #99f6e4; }
+body.theme-night #timetable-box { background: #171a24; border-color: #262a38; }
+body.theme-night .timetable-dir-title { color: #cfe0ff; }
+body.theme-night .timetable-time { background: #223055; color: #cfe0ff; }
 body.theme-night .query-left select, body.theme-night .query-left input[type="text"],
 body.theme-night .query-nearby-section select, body.theme-night .query-nearby-section input[type="text"] {
-  background: var(--ink-panel); color: #eee; border-color: var(--ink-line);
+  background: #171a24; color: #eee; border-color: #2a3350;
 }
 body.theme-night .query-left label, body.theme-night .query-nearby-section label { color: #cfd8ff; }
 body.theme-night #nearby-result .stop-item, body.theme-night #adv-search-result .route-item {
-  border-color: var(--ink-line);
+  border-color: #262a38;
 }
-body.theme-night #chat-messages { background: var(--ink-deep); border-color: var(--ink-line); }
-body.theme-night .chat-msg.user { background: var(--signal-dim); }
-body.theme-night .chat-msg.assistant { background: var(--ink-panel); }
+body.theme-night #chat-messages { background: #12131a; border-color: #262a38; }
+body.theme-night .chat-msg.user { background: #1d2c4d; }
+body.theme-night .chat-msg.assistant { background: #1a1d29; }
 body.theme-night #yellow-bus-picker { background: #241f0d; border-color: #5c4a1166; }
-body.theme-night #yellow-bus-picker select { background: var(--ink-panel); color: #eee; border-color: var(--ink-line); }
+body.theme-night #yellow-bus-picker select { background: #171a24; color: #eee; border-color: #2a3350; }
 
 /* ── 到站鈴聲提醒 ─────────────────────────────────────── */
 #reminder-banner {
   position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
-  background: var(--alert); color: #2b1c00; padding: 12px 22px; border-radius: 10px;
+  background: #16a085; color: #fff; padding: 12px 22px; border-radius: 10px;
   font-weight: bold; font-size: 14px; z-index: 9999; box-shadow: 0 4px 16px rgba(0,0,0,.35);
   max-width: 90vw; text-align: center;
 }
