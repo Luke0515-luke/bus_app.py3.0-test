@@ -5,6 +5,7 @@ import time
 import uuid
 import concurrent.futures
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, render_template, request, jsonify, session
@@ -1008,34 +1009,97 @@ REALTIME_POSITIONS_FILE = os.path.join(REALTIME_DATA_DIR, "positions.json")
 REALTIME_ETA_FILE = os.path.join(REALTIME_DATA_DIR, "eta.json")
 REALTIME_META_FILE = os.path.join(REALTIME_DATA_DIR, "meta.json")
 REALTIME_LOCK_FILE = os.path.join(REALTIME_DATA_DIR, ".poll.lock")
-REALTIME_POLL_SECONDS = 60      # 每 1 分鐘抓一次
-REALTIME_STALE_SECONDS = 90     # 超過這個秒數還沒成功更新過，視為「尚未更新資料」
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+
+
+def _taipei_now():
+    # 不管伺服器本身時區設定是什麼（Render 預設常常是 UTC），一律用台北時間判斷，
+    # 避免離峰／尖峰／收班時段判斷錯位 8 小時。
+    return datetime.now(TAIPEI_TZ)
+
+
+# ── 智慧輪詢時刻表：首末班車、尖峰／離峰、深夜收班 ──────────────────
+SERVICE_START = (5, 30)   # 05:30 首班車
+SERVICE_END = (23, 0)     # 23:00 末班車
+PEAK_WINDOWS = [((6, 0), (8, 0)), ((17, 0), (19, 0))]  # 上下班／放學尖峰
+PEAK_INTERVAL_SECONDS = 6 * 60     # 尖峰每 6 分鐘抓一次
+OFFPEAK_INTERVAL_SECONDS = 15 * 60  # 離峰每 15 分鐘抓一次
+SERVICE_CLOSED_MESSAGE = "🌙 末班車已收車，明日 05:30 恢復發車"
+
+
+def _minutes_of(t):
+    return t.hour * 60 + t.minute
+
+
+def _in_window(now, start, end):
+    m = _minutes_of(now)
+    return _minutes_of(datetime(2000, 1, 1, *start)) <= m < _minutes_of(datetime(2000, 1, 1, *end))
+
+
+def is_service_hours(now=None):
+    now = now or _taipei_now()
+    return _in_window(now, SERVICE_START, SERVICE_END)
+
+
+def get_smart_poll_interval(now=None):
+    """回傳現在這一刻該用的輪詢間隔秒數；深夜收班時段回傳 None，
+    代表這一輪完全不要向 TDX 發任何請求（額度歸零）。"""
+    now = now or _taipei_now()
+    if not is_service_hours(now):
+        return None
+    for start, end in PEAK_WINDOWS:
+        if _in_window(now, start, end):
+            return PEAK_INTERVAL_SECONDS
+    return OFFPEAK_INTERVAL_SECONDS
+
+
+def _seconds_until_service_resumes(now=None):
+    """深夜收班時，算出距離明天／今天 05:30 還有幾秒，讓背景執行緒可以直接一次
+    睡到該恢復發車的時間點，不用每分鐘醒來白白檢查。"""
+    now = now or _taipei_now()
+    resume = now.replace(hour=SERVICE_START[0], minute=SERVICE_START[1], second=0, microsecond=0)
+    if resume <= now:
+        resume += timedelta(days=1)
+    return max(30, (resume - now).total_seconds())
+
+
+REALTIME_STALE_SECONDS = 20 * 60  # 超過這個秒數還沒成功更新過，視為「尚未更新資料」（配合最長 15 分鐘的離峰間隔）
+REALTIME_PUSH_MIN_INTERVAL = 5 * 60  # 記憶體／本機檔案每輪都更新沒關係，但推送到 GitHub 至少間隔這麼多秒才真的推送一次
 
 _realtime_lock = threading.Lock()
 _realtime_cache = {
     "positions_by_route": {},
     "eta_by_route": {},
     "updated_at": None,       # 最近一次「成功」更新的時間
+    "eta_fetched_at": None,   # 最近一次成功更新 eta_by_route 的時間戳（epoch 秒），給前端算即時倒數用
     "last_attempt": None,     # 最近一次「嘗試」更新的時間（不管成功與否）
     "last_attempt_ok": None,
+    "service_closed": False,  # 是否在深夜收班時段（此時完全不打 TDX）
 }
 _realtime_file_mtime = None  # 記憶體裡這份快照，是對應到「檔案」的哪個修改時間
+_last_realtime_push_at = 0   # 上一次真的推送到 GitHub 的時間戳（節流用，見 REALTIME_PUSH_MIN_INTERVAL）
 
 
 def get_realtime_status():
     """回傳目前這份共用快照的新鮮度，給 API 附加在回應裡，讓前端可以在資料
     太舊（代表後台排程可能連續失敗）時顯示「尚未更新資料」，而不是讓使用者
-    誤以為看到的一定是最新狀態。"""
+    誤以為看到的一定是最新狀態。同時附上 service_closed（是否深夜收班中）
+    跟 eta_fetched_at（epoch 秒，給前端算即時倒數用）。"""
     with _realtime_lock:
         updated_at = _realtime_cache.get("updated_at")
+        service_closed = bool(_realtime_cache.get("service_closed"))
+        eta_fetched_at = _realtime_cache.get("eta_fetched_at")
     if not updated_at:
-        return {"updated_at": None, "is_fresh": False, "age_seconds": None}
+        return {"updated_at": None, "is_fresh": False, "age_seconds": None,
+                "service_closed": service_closed, "eta_fetched_at": eta_fetched_at}
     try:
         updated_dt = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
     except Exception:
-        return {"updated_at": updated_at, "is_fresh": False, "age_seconds": None}
+        return {"updated_at": updated_at, "is_fresh": False, "age_seconds": None,
+                "service_closed": service_closed, "eta_fetched_at": eta_fetched_at}
     age = (datetime.now() - updated_dt).total_seconds()
-    return {"updated_at": updated_at, "is_fresh": age <= REALTIME_STALE_SECONDS, "age_seconds": int(age)}
+    return {"updated_at": updated_at, "is_fresh": age <= REALTIME_STALE_SECONDS, "age_seconds": int(age),
+            "service_closed": service_closed, "eta_fetched_at": eta_fetched_at}
 
 
 def _load_realtime_cache_from_disk():
@@ -1186,6 +1250,7 @@ def _realtime_poll_once():
                 merged_eta = dict(_realtime_cache.get("eta_by_route") or {})
                 merged_eta.update(eta_by_route)
                 _realtime_cache["eta_by_route"] = merged_eta
+                _realtime_cache["eta_fetched_at"] = time.time()
             if ok:
                 _realtime_cache["updated_at"] = now_str
             _realtime_cache["last_attempt"] = now_str
@@ -1195,10 +1260,17 @@ def _realtime_poll_once():
 
         _write_realtime_snapshot(snapshot_positions, snapshot_eta, ok, now_str)
 
-        try:
-            push_realtime_backup(REALTIME_DATA_DIR)
-        except Exception as e:
-            print(f"❌ 即時資料推送到 GitHub 失敗：{e}", flush=True)
+        # 記憶體／本機檔案每輪都更新沒關係，但推送到 GitHub 沒必要跟著尖峰的
+        # 6 分鐘一輪跑，那只是給「Render 重啟後找回上次資料」用的備份，不是
+        # 使用者查詢會用到的路徑，這裡節流成至少間隔 REALTIME_PUSH_MIN_INTERVAL
+        # 秒才真的推送一次。
+        global _last_realtime_push_at
+        if time.time() - _last_realtime_push_at >= REALTIME_PUSH_MIN_INTERVAL:
+            try:
+                push_realtime_backup(REALTIME_DATA_DIR)
+                _last_realtime_push_at = time.time()
+            except Exception as e:
+                print(f"❌ 即時資料推送到 GitHub 失敗：{e}", flush=True)
 
         print(f"{'✅' if ok else '⚠️'} 即時公車資料排程：定位 {len(positions_all or [])} 筆、"
               f"到站預估 {sum(len(v) for v in eta_by_route.values())} 筆（來源：{eta_source}），"
@@ -1212,15 +1284,31 @@ def _realtime_poll_once():
 
 
 def _realtime_poll_loop():
-    """每 REALTIME_POLL_SECONDS（1 分鐘）跑一次 _realtime_poll_once()，
+    """智慧輪詢排程：
+      - 05:30～23:00 營運時間內，尖峰（6-8點／17-19點）每 6 分鐘查一次 TDX，
+        離峰每 15 分鐘查一次，取代原本固定頻率的做法，節省 TDX 額度。
+      - 23:00～05:30 深夜收班時段，完全不打 TDX（額度歸零），把快照標記成
+        service_closed，前端據此顯示「末班車已收車」，並直接一次睡到 05:30，
+        不用每分鐘醒來白檢查。
     跟現有備份路線資料用的 backup_loop／scheduler_thread 是各自獨立的排程執行緒，
     互不影響。"""
     while True:
         try:
+            interval = get_smart_poll_interval()
+            if interval is None:
+                with _realtime_lock:
+                    _realtime_cache["service_closed"] = True
+                sleep_s = _seconds_until_service_resumes()
+                print(f"🌙 深夜收班時段，暫停向 TDX 查詢，{sleep_s/3600:.1f} 小時後（05:30）恢復。", flush=True)
+                time.sleep(sleep_s)
+                continue
+            with _realtime_lock:
+                _realtime_cache["service_closed"] = False
             _realtime_poll_once()
         except Exception as e:
             print(f"❌ 即時資料排程發生例外：{e}", flush=True)
-        time.sleep(REALTIME_POLL_SECONDS)
+            interval = OFFPEAK_INTERVAL_SECONDS
+        time.sleep(interval)
 
 
 _load_realtime_cache_from_disk()
@@ -1645,6 +1733,16 @@ def api_route_status():
         return jsonify({"error": "缺少路線"}), 400
 
     state = get_state()
+
+    # 深夜收班時段：不管快取裡還留著什麼舊資料，一律不顯示任何到站預估
+    # （避免使用者看到收班前殘留的「5 分鐘」誤以為現在還有車），直接回覆
+    # 「末班車已收車」，也不用再多花一次天氣查詢或站牌整理的運算。
+    if not is_service_hours():
+        return jsonify({
+            "dest0": "", "dest1": "", "stops": [], "empty": True,
+            "service_closed": True, "closed_message": SERVICE_CLOSED_MESSAGE,
+        })
+
     weather_info = fetch_weather()
     state["current_weather"] = weather_info
 
@@ -1740,6 +1838,7 @@ def api_route_status():
             is_low, car_size = item.get("IsLowFloor", False), "大巴"
 
         time_text, badge_class = eta_status_text(eta, status)
+        eta_seconds_out = eta  # 給前端做「即時倒數」用的數字秒數，跟著 time_text 一起維護
 
         # ETA 端點沒有這站的資料，但 GPS 定位確認附近真的有車在跑 → 用 GPS 資料補正，
         # 不要讓使用者看到「尚未發車」卻其實漏掉了一班查得到的車
@@ -1749,6 +1848,7 @@ def api_route_status():
             if not plate:
                 plate = gps_bus.get("PlateNumb", "")
             time_text, badge_class = "進站中", "ts-red"
+            eta_seconds_out = 0
 
         # 即時動態、GPS 都完全查不到這一站的資料時，分兩種情況處理：
         # ① 這條路線這個方向「後面已經有確認在跑的車」（前面某一站有真的 TDX eta，
@@ -1772,6 +1872,7 @@ def api_route_status():
             anchor_idx, anchor_eta = last_anchor
             calc_eta = anchor_eta + (idx - anchor_idx) * 120
             time_text, badge_class = eta_status_text(calc_eta, status)
+            eta_seconds_out = calc_eta
             is_calculated_estimate = True
         elif status == 1:
             est_from_schedule = estimate_eta_from_schedule(schedule_dep_times, idx)
@@ -1779,6 +1880,7 @@ def api_route_status():
                 mins = int(est_from_schedule // 60)
                 time_text = "即將進站（時刻表估計）" if mins <= 0 else f"約 {mins} 分鐘（時刻表估計）"
                 badge_class = "ts-blue"
+                eta_seconds_out = est_from_schedule
 
         # 支線／繞道：這一班車實際開往的目的地跟這條路線平常公告的方向不一樣時，
         # 特別標示出來，不要讓人誤以為所有車都開到同一個終點站。
@@ -1815,6 +1917,7 @@ def api_route_status():
         stops_out.append({
             "name": s_name,
             "eta_text": time_text,
+            "eta_seconds": eta_seconds_out,
             "badge_class": badge_class,
             "plate": plate if show_bus_tag else "",
             "car_size": car_size,
@@ -1848,16 +1951,25 @@ def api_route_status():
     state["bus_status"] = bus_status
 
     realtime_status = get_realtime_status()
+    # 支線／繞道摘要：把整條路線目前查得到的支線車輛集中列一份清單，
+    # 給前端「展開箭頭」用，不用使用者自己一站一站找哪裡有標示支線。
+    branch_summary = [
+        {"stop": s["name"], "plate": s["plate"], "to": s["branch"]}
+        for s in stops_out if s["branch"]
+    ]
     return jsonify({
         "dest0": dest_0, "dest1": dest_1,
         "weather": weather_info,
         "stops": stops_out,
+        "branches": branch_summary,
         "ubike_suggestion": ubike_suggestion,
         "tts_text": "".join(tts_lines),
         "active_bus_count": active_bus_count,
         "empty": False,
+        "service_closed": False,
         "data_fresh": realtime_status["is_fresh"],
         "data_updated_at": realtime_status["updated_at"],
+        "eta_fetched_at": realtime_status["eta_fetched_at"],
         "data_age_seconds": realtime_status["age_seconds"],
     })
 
