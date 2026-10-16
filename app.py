@@ -24,6 +24,7 @@ import asyncio
 import threading
 import shutil
 import fcntl
+import calendar
 
 load_dotenv()
 
@@ -304,106 +305,344 @@ def _filter_route_entries(data, route_name):
     return filtered
 
 
-def _fetch_and_save_stop_data(route_name):
-    """即時向 TDX 查詢某路線的 StopOfRoute 原始資料，驗證路線名稱後才存檔。"""
-    url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/StopOfRoute/City/Tainan/{route_name}?%24format=JSON"
-    res = tdx_get(url, timeout=10, retries=1)
+# ══════════════════════════════════════════════════════════
+# TDX 每月用量控管（免費額度 3000 次／月，這裡把上限壓在 2800 次以下）
+# ══════════════════════════════════════════════════════════
+# 所有對 TDX「資料 API」的請求都必須經過 tdx_get()，tdx_get() 每發一次請求就在這裡
+# 記一筆（失敗、逾時也算，因為 TDX 是用請求次數計費）。計數存在
+# /opt/render/project/data/tdx_usage.json（會跟著原本的備份機制一起備份），
+# 每個月自動歸零，多個 worker process 之間用 flock 共用同一個計數。
+DATA_DIR = "/opt/render/project/data"
+TDX_MONTHLY_CAP = 2800          # 絕對上限：靜態資料（每月 1 號更新）最多可用到這裡
+TDX_DYNAMIC_CAP = 2780          # 即時資料（到站／定位／UBike）只用到這裡，留 20 次給靜態資料補抓
+TDX_MANUAL_DAILY_LIMIT = 10     # 網頁上手動按鈕（單一路線重抓等）每天最多能打幾次 TDX
+TDX_USAGE_FILE = os.path.join(DATA_DIR, "tdx_usage.json")
+TDX_USAGE_LOCK_FILE = os.path.join(DATA_DIR, ".tdx_usage.lock")
+_usage_thread_lock = threading.Lock()
+
+
+def _usage_blank(month):
+    return {"month": month, "count": 0, "by_kind": {}, "manual_day": "", "manual_count": 0}
+
+
+def _tdx_usage_txn(fn):
+    """在 flock 保護下「讀取 → 修改 → 寫回」用量計數檔，fn(usage) 的回傳值會原樣回傳。"""
+    with _usage_thread_lock:
+        lock_fp = None
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            lock_fp = open(TDX_USAGE_LOCK_FILE, "w")
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        except Exception:
+            lock_fp = None
+        try:
+            month = _taipei_now().strftime("%Y-%m")
+            try:
+                with open(TDX_USAGE_FILE, "r", encoding="utf-8") as f:
+                    usage = json.load(f)
+                if not isinstance(usage, dict) or usage.get("month") != month:
+                    usage = _usage_blank(month)
+            except (FileNotFoundError, json.JSONDecodeError):
+                usage = _usage_blank(month)
+            result = fn(usage)
+            tmp = TDX_USAGE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(usage, f, ensure_ascii=False)
+            os.replace(tmp, TDX_USAGE_FILE)
+            return result
+        finally:
+            if lock_fp is not None:
+                try:
+                    fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                lock_fp.close()
+
+
+def tdx_budget_consume(kind):
+    """發 TDX 請求「之前」呼叫：還有額度就扣一次並回傳 True，沒額度回傳 False（呼叫端就不能發請求）。
+    kind：'static'（每月靜態資料）、'dynamic'（到站／定位／UBike 排程）、'manual'（網頁手動按鈕）。"""
+    def txn(u):
+        cap = TDX_MONTHLY_CAP if kind == "static" else TDX_DYNAMIC_CAP
+        if u["count"] >= cap:
+            return False
+        if kind == "manual":
+            today = _taipei_now().strftime("%Y-%m-%d")
+            if u.get("manual_day") != today:
+                u["manual_day"], u["manual_count"] = today, 0
+            if u["manual_count"] >= TDX_MANUAL_DAILY_LIMIT:
+                return False
+            u["manual_count"] += 1
+        u["count"] += 1
+        u["by_kind"][kind] = u["by_kind"].get(kind, 0) + 1
+        return True
+    try:
+        return _tdx_usage_txn(txn)
+    except Exception as e:
+        # 計數檔讀寫壞掉時寧可讓服務繼續（只印警告），不要因此整個停擺
+        print(f"⚠️ TDX 用量計數檔讀寫失敗（本次請求照常放行）：{e}", flush=True)
+        return True
+
+
+def tdx_usage_snapshot():
+    """回傳目前這個月的用量（唯讀），給排程節流、管理端點用。"""
+    try:
+        return _tdx_usage_txn(lambda u: json.loads(json.dumps(u)))
+    except Exception:
+        return _usage_blank(_taipei_now().strftime("%Y-%m"))
+
+
+def _pacing_allows_optional_poll(now=None, margin=150):
+    """非尖峰（離峰／週末）的輪詢才需要過這一關：把整個月的額度按日期比例攤開，
+    如果目前已用量超過「這個時間點該有的進度 ＋ 150 次緩衝」，就先跳過這一輪，
+    等進度追回來再抓。尖峰時段不受影響。這是保證整個月不會爆量的第二道保險
+    （第一道是 tdx_budget_consume 的硬上限）。"""
+    now = now or _taipei_now()
+    used = tdx_usage_snapshot().get("count", 0)
+    dim = calendar.monthrange(now.year, now.month)[1]
+    frac = ((now.day - 1) + (now.hour * 60 + now.minute) / 1440.0) / dim
+    return used <= TDX_MONTHLY_CAP * frac + margin
+
+
+# ══════════════════════════════════════════════════════════
+# 靜態資料：每月 1 號用「全台南一次查詢」抓齊，存成檔案，平常只讀檔
+# ══════════════════════════════════════════════════════════
+# 公車路線軌跡（Shape）、站牌順序與座標（StopOfRoute）、固定時刻表（Schedule）、
+# 全部站牌（Stop，附近站牌用）、路線清單（Route）、UBike 站點（Bike/Station）。
+# 以前是「每條路線各查一次」（150 幾條 × 3 種 ＝ 好幾百次），現在改成每種資料
+# 各查一次整個台南（共 6 次），再依路線名稱拆成原本的 {路線}_route_stop.json 等檔案，
+# 讀取端（load_route_*_data）完全不用改，只是不再於缺檔時即時打 TDX。
+STATIC_META_FILE = os.path.join(ROUTE_DATA_SAVE_DIR, "_static_meta.json")
+ALL_BUS_STOPS_FILE = os.path.join(ROUTE_DATA_SAVE_DIR, "_all_bus_stops.json")
+ALL_ROUTE_META_FILE = os.path.join(ROUTE_DATA_SAVE_DIR, "_all_route_meta.json")
+UBIKE_STATIONS_FILE = os.path.join(ROUTE_DATA_SAVE_DIR, "_ubike_stations.json")
+UBIKE_AVAIL_FILE = os.path.join(DATA_DIR, "ubike_avail.json")
+# False：站牌／軌跡只存「ALL_ROUTE_NAMES＋已存過＋小黃公車」的路線（跟舊版地圖清單一致）；
+# True：TDX 回傳的每一條路線都存（地圖路線清單會多出系統分類表沒列的路線）。
+SAVE_ALL_ROUTES = False
+STATIC_MAX_ATTEMPTS_PER_DAY = 3     # 靜態資料某天最多嘗試補抓幾輪，避免失敗時一直燒額度
+STATIC_FORCE_COOLDOWN_SECONDS = 24 * 3600  # 手動「更新全台南站點快取」最短間隔
+_static_refresh_lock = threading.Lock()
+_json_file_cache = {}
+
+_STATIC_DATASETS = {
+    # 名稱: (TDX 路徑, timeout)
+    "stop": ("Bus/StopOfRoute/City/Tainan", 90),
+    "shape": ("Bus/Shape/City/Tainan", 90),
+    "schedule": ("Bus/Schedule/City/Tainan", 90),
+    "bus_stops": ("Bus/Stop/City/Tainan", 60),
+    "route_meta": ("Bus/Route/City/Tainan", 60),
+    "ubike_stations": ("Bike/Station/City/Tainan", 30),
+}
+
+
+def _atomic_write_json(path, obj, indent=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=indent)
+    os.replace(tmp, path)
+
+
+def _read_json_cached(path, default):
+    """讀 JSON 檔；檔案沒變（修改時間相同）就直接用記憶體裡的，不重複解析大檔。"""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return default
+    hit = _json_file_cache.get(path)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return default
+    _json_file_cache[path] = (mtime, data)
+    return data
+
+
+def _tdx_get_json(path, timeout, kind):
+    url = f"https://tdx.transportdata.tw/api/basic/v2/{path}?%24format=JSON"
+    res = tdx_get(url, timeout=timeout, retries=0, kind=kind)
     if res is None:
         return None
     try:
         data = res.json()
     except Exception:
         return None
-    data = _filter_route_entries(data, route_name)
+    return data if isinstance(data, list) else None
+
+
+def _group_entries_by_route(data):
+    grouped = {}
+    for entry in data or []:
+        if isinstance(entry, dict):
+            name = _entry_route_name(entry)
+            if name:
+                grouped.setdefault(name, []).append(entry)
+    return grouped
+
+
+def _yellow_bus_route_names(route_meta):
+    names = set()
+    for r in route_meta or []:
+        name = (r.get("RouteName") or {}).get("Zh_tw", "")
+        ops = [(op.get("OperatorName") or {}).get("Zh_tw", "") for op in (r.get("Operators") or [])]
+        if name and any(any(kw in on for kw in _YELLOW_BUS_OPERATOR_KEYWORDS) for on in ops):
+            names.add(name)
+    return names
+
+
+def _static_dataset_present(name):
+    """檔案還在不在（Render 清碟、備份沒還原時，meta 說做完了但檔案其實沒了，要能偵測到）。"""
+    try:
+        files = os.listdir(ROUTE_DATA_SAVE_DIR)
+    except FileNotFoundError:
+        return False
+    if name == "stop":
+        return any(f.endswith("_route_stop.json") for f in files)
+    if name == "shape":
+        return any(f.endswith("_route_shape.json") for f in files)
+    if name == "schedule":
+        return any(f.endswith("_route_timetable.json") for f in files)
+    single = {"bus_stops": ALL_BUS_STOPS_FILE, "route_meta": ALL_ROUTE_META_FILE,
+              "ubike_stations": UBIKE_STATIONS_FILE}
+    return os.path.exists(single[name])
+
+
+def refresh_static_data(force=False):
+    """每月 1 號（或這個月第一次啟動、檔案不見時）把靜態資料一次抓齊，共 6 次 TDX 請求。
+    - 平常（force=False）：本月已完成的資料集會自動略過，只補抓沒做完的；
+      同一天最多嘗試 STATIC_MAX_ATTEMPTS_PER_DAY 輪，失敗也不會無限重試。
+    - force=True（網頁上的「更新全台南站點快取」按鈕）：全部重抓，但 24 小時內只能按一次。
+    回傳 dict，status 為 success / partial / skipped / cooldown / busy。"""
+    if not _static_refresh_lock.acquire(blocking=False):
+        return {"status": "busy"}
+    try:
+        now = _taipei_now()
+        month, today = now.strftime("%Y-%m"), now.strftime("%Y-%m-%d")
+        meta = _read_json_cached(STATIC_META_FILE, {}) or {}
+        if meta.get("month") != month:
+            meta = {"month": month, "done": [], "attempts": {}, "last_forced": meta.get("last_forced", 0)}
+        done = set(meta.get("done", [])) if not force else set()
+        done = {d for d in done if _static_dataset_present(d)}
+
+        if force:
+            if time.time() - float(meta.get("last_forced") or 0) < STATIC_FORCE_COOLDOWN_SECONDS:
+                return {"status": "cooldown"}
+            meta["last_forced"] = time.time()
+        todo = [d for d in _STATIC_DATASETS if d not in done]
+        if not todo:
+            return {"status": "skipped", "reason": "本月已完成"}
+        attempts = meta.setdefault("attempts", {})
+        if not force:
+            if attempts.get(today, 0) >= STATIC_MAX_ATTEMPTS_PER_DAY:
+                return {"status": "skipped", "reason": "今天補抓次數已達上限"}
+        attempts[today] = attempts.get(today, 0) + 1
+        meta["attempts"] = {today: attempts[today]}   # 只留今天，檔案不要越長越大
+        meta["done"] = sorted(done)
+        _atomic_write_json(STATIC_META_FILE, meta)     # 先記錄「嘗試過了」，程式中途掛掉也不會狂重試
+
+        print(f"🗓️ 靜態資料更新開始（{month}），要抓：{'、'.join(todo)}", flush=True)
+        fetched = {}
+        for name in todo:
+            path, timeout = _STATIC_DATASETS[name]
+            data = _tdx_get_json(path, timeout, "static")
+            if data:
+                fetched[name] = data
+            else:
+                print(f"⚠️ 靜態資料「{name}」這一輪沒抓到（之後最多再補抓 {STATIC_MAX_ATTEMPTS_PER_DAY} 輪／天）", flush=True)
+
+        # 路線清單最先處理：小黃公車名單要靠它判斷
+        if "route_meta" in fetched:
+            _atomic_write_json(ALL_ROUTE_META_FILE, fetched["route_meta"])
+        if "bus_stops" in fetched:
+            _atomic_write_json(ALL_BUS_STOPS_FILE, fetched["bus_stops"])
+        if "ubike_stations" in fetched:
+            _atomic_write_json(UBIKE_STATIONS_FILE, fetched["ubike_stations"])
+
+        route_meta = fetched.get("route_meta") or _read_json_cached(ALL_ROUTE_META_FILE, [])
+        if SAVE_ALL_ROUTES:
+            wanted = None
+        else:
+            wanted = set(get_all_known_routes()) | _yellow_bus_route_names(route_meta)
+
+        routes_saved = 0
+        for name, path_fn in (("stop", _route_stop_file_path), ("shape", _route_shape_file_path),
+                              ("schedule", _route_timetable_file_path)):
+            if name not in fetched:
+                continue
+            grouped = _group_entries_by_route(fetched[name])
+            count = 0
+            for route, entries in grouped.items():
+                # 時刻表每條路線都存（小黃公車等需要）；站牌／軌跡依 wanted 篩選
+                if name != "schedule" and wanted is not None and route not in wanted:
+                    continue
+                _save_route_json(path_fn(route), entries)
+                count += 1
+            if name == "stop":
+                routes_saved = count
+            print(f"   ✔ {name}：寫入 {count} 條路線的檔案", flush=True)
+
+        done |= set(fetched.keys())
+        meta["done"] = sorted(done)
+        _atomic_write_json(STATIC_META_FILE, meta)
+
+        _cache_store.clear()
+        _stop_route_index_cache["data"] = None
+        _stop_route_index_cache["time"] = 0
+        ok = len(done) == len(_STATIC_DATASETS)
+        print(f"{'✅' if ok else '⚠️'} 靜態資料更新結束：完成 {len(done)}/{len(_STATIC_DATASETS)} 項", flush=True)
+        return {"status": "success" if ok else "partial", "routes_saved": routes_saved,
+                "done": sorted(done), "missing": [d for d in _STATIC_DATASETS if d not in done]}
+    finally:
+        _static_refresh_lock.release()
+
+
+def _fetch_and_save_stop_data(route_name):
+    """（手動單一路線重抓用）向 TDX 查某路線的 StopOfRoute，驗證路線名稱後存檔。
+    只給 /api/save_route_data 用，算『手動』額度（每天上限 TDX_MANUAL_DAILY_LIMIT 次）。"""
+    data = _tdx_get_json(f"Bus/StopOfRoute/City/Tainan/{route_name}", 15, "manual")
+    data = _filter_route_entries(data, route_name) if data else None
     if data:
         _save_route_json(_route_stop_file_path(route_name), data)
     return data
 
 
 def _fetch_and_save_shape_data(route_name):
-    """即時向 TDX 查詢某路線的 Shape 原始資料，驗證路線名稱後才存檔。"""
-    url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/Shape/City/Tainan/{route_name}?%24format=JSON"
-    res = tdx_get(url, timeout=10, retries=1)
-    if res is None:
-        return None
-    try:
-        data = res.json()
-    except Exception:
-        return None
-    data = _filter_route_entries(data, route_name)
+    """（手動單一路線重抓用）向 TDX 查某路線的 Shape，驗證路線名稱後存檔。"""
+    data = _tdx_get_json(f"Bus/Shape/City/Tainan/{route_name}", 15, "manual")
+    data = _filter_route_entries(data, route_name) if data else None
     if data:
         _save_route_json(_route_shape_file_path(route_name), data)
     return data
 
 
-def _fetch_and_save_timetable_data(route_name):
-    """即時向 TDX 查詢某路線的固定時刻表（Bus/Schedule）原始資料，驗證路線名稱後才存檔。
-    跟站牌／軌跡走同一套「查一次、之後都吃檔案」的邏輯，避免每次打開時刻表都要
-    重新等 TDX 回應（TDX 這支端點常常比較慢，手機在訊號不穩時容易直接 fetch 失敗）。"""
-    url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/Schedule/City/Tainan/{route_name}?%24format=JSON"
-    res = tdx_get(url, timeout=15, retries=1)
-    if res is None:
-        return None
+def _load_route_file(path, route_name):
+    """只讀存檔，絕不即時打 TDX。檔案不存在、損毀、或內容不屬於這條路線都回傳 []。"""
     try:
-        data = res.json()
-    except Exception:
-        return None
-    data = _filter_route_entries(data, route_name)
-    if data:
-        _save_route_json(_route_timetable_file_path(route_name), data)
-    return data
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    valid = _filter_route_entries(data, route_name)
+    return valid or []
 
 
 def load_route_stop_data(route_name):
-    """優先讀取已存檔的 StopOfRoute 資料（會被自動備份到 GitHub）；
-    檔案不存在、損毀，或內容其實是其他路線的資料（舊版沒有驗證時可能存錯），
-    都會視同快取失效，重新向 TDX 查一次並用驗證過的新資料覆蓋舊檔。"""
-    path = _route_stop_file_path(route_name)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        valid = _filter_route_entries(data, route_name)
-        if valid:
-            return valid
-        if data:
-            print(f"⚠️「{route_name}」的存檔資料與路線名稱不符（疑似存到其他路線），將重新查詢並覆蓋。")
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-    return _fetch_and_save_stop_data(route_name) or []
+    """讀取已存檔的 StopOfRoute（每月 1 號更新），不會打 TDX。"""
+    return _load_route_file(_route_stop_file_path(route_name), route_name)
 
 
 def load_route_shape_data(route_name):
-    """優先讀取已存檔的 Shape 資料（會被自動備份到 GitHub）；
-    檔案不存在、損毀，或內容其實是其他路線的資料，都會重新向 TDX 查一次並覆蓋舊檔。"""
-    path = _route_shape_file_path(route_name)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        valid = _filter_route_entries(data, route_name)
-        if valid:
-            return valid
-        if data:
-            print(f"⚠️「{route_name}」的存檔資料與路線名稱不符（疑似存到其他路線），將重新查詢並覆蓋。")
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-    return _fetch_and_save_shape_data(route_name) or []
+    """讀取已存檔的 Shape（每月 1 號更新），不會打 TDX。"""
+    return _load_route_file(_route_shape_file_path(route_name), route_name)
 
 
 def load_route_timetable_data(route_name):
-    """優先讀取已存檔的固定時刻表資料（會被自動備份到 GitHub）；
-    檔案不存在、損毀，或內容其實是其他路線的資料，都會重新向 TDX 查一次並覆蓋舊檔。"""
-    path = _route_timetable_file_path(route_name)
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        valid = _filter_route_entries(data, route_name)
-        if valid:
-            return valid
-        if data:
-            print(f"⚠️「{route_name}」的時刻表存檔與路線名稱不符（疑似存到其他路線），將重新查詢並覆蓋。")
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-    return _fetch_and_save_timetable_data(route_name) or []
+    """讀取已存檔的固定時刻表（每月 1 號更新），不會打 TDX。"""
+    return _load_route_file(_route_timetable_file_path(route_name), route_name)
 
 
 def _cleanup_known_bad_route_files():
@@ -699,6 +938,7 @@ def new_chat_session(state):
 
 
 # ── TDX 認證 ──────────────────────────────────────────────
+# ── TDX 認證 ──────────────────────────────────────────────
 @cached(3600)
 def get_tdx_token():
     try:
@@ -713,17 +953,34 @@ def get_tdx_token():
         return ""
 
 
+_TOKEN_CACHE_KEY = "get_tdx_token:():{}"
+
+
 def tdx_headers():
     return {'authorization': f'Bearer {get_tdx_token()}', 'Accept-Encoding': 'gzip'}
 
 
-def tdx_get(url, timeout=8, retries=1):
-    """帶重試的 TDX GET，減少大量平行請求時偶發逾時/限流造成的空白資料。"""
+def tdx_get(url, timeout=8, retries=0, kind="dynamic"):
+    """整個程式『唯一』對 TDX 資料 API 發請求的出入口。每發一次請求（不管成功失敗）
+    都先過 tdx_budget_consume() 扣一次月額度，額度用完就直接回傳 None、不發請求。
+    retries 預設改成 0：重試也是一次計費的請求，3000 次額度很緊，失敗就等下一輪排程再抓。
+    kind：'static'（每月靜態資料）／'dynamic'（排程即時資料）／'manual'（手動按鈕）。"""
+    token = get_tdx_token()
+    if not token:
+        _cache_store.pop(_TOKEN_CACHE_KEY, None)   # 拿 token 失敗不要被快取住一個小時
+        return None
+    headers = {'authorization': f'Bearer {token}', 'Accept-Encoding': 'gzip'}
     for attempt in range(retries + 1):
+        if not tdx_budget_consume(kind):
+            print(f"⛔ TDX 本月額度已達上限（或手動額度用完），略過請求：{url.split('?')[0]}", flush=True)
+            return None
         try:
-            res = requests.get(url, headers=tdx_headers(), timeout=timeout)
+            res = requests.get(url, headers=headers, timeout=timeout)
             if res.status_code == 200:
                 return res
+            if res.status_code == 401:
+                _cache_store.pop(_TOKEN_CACHE_KEY, None)   # token 失效，下次重新取
+                return None
         except Exception:
             pass
         if attempt < retries:
@@ -764,93 +1021,36 @@ def fetch_route_stops_by_direction(route_name, direction):
     return []
 
 
-def _fetch_bus_data_from_tdx(route_name):
-    """實際向 TDX 查詢單一路線的到站預估時間（EstimatedTimeOfArrival）。
-    只給下面的後台排程呼叫，一般 API 請求改讀 fetch_bus_data() 的共用快照。
-    改用 tdx_get()（內建重試一次），單一路線偶發逾時／限流時不會直接放棄，
-    這樣『很多站的時間都是從時刻表推的』這個狀況會少很多——那通常就是因為
-    這支查詢那一輪剛好失敗，導致這條路線完全沒有即時資料可用，才會整條路線
-    都退回時刻表估計。"""
-    url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/EstimatedTimeOfArrival/City/Tainan/{route_name}?%24format=JSON"
-    res = tdx_get(url, timeout=8, retries=1)
-    if res is not None:
-        try:
-            return res.json()
-        except Exception:
-            pass
-    return None
-
-
 def fetch_bus_data_all():
-    """一次性向 TDX 拿『全台南所有路線』的到站預估時間，只給後台排程呼叫，
-    取代原本每條路線各自查一次 TDX 的做法（跟 fetch_bus_realtime_positions()
-    不帶路線名稱時拿『全部公車定位』是同一種寫法）。"""
+    """一次性向 TDX 拿『全台南所有路線』的到站預估時間（含每站的車牌），只給後台排程呼叫。
+    整個台南只算 1 次請求。失敗回傳 None（等下一輪排程，不即時重試、也不退回逐條路線查詢——
+    那一輪就要一百多次請求，3000 次的月額度撐不住）。"""
     url = "https://tdx.transportdata.tw/api/basic/v2/Bus/EstimatedTimeOfArrival/City/Tainan?%24format=JSON"
-    res = tdx_get(url, timeout=25, retries=0)
+    res = tdx_get(url, timeout=30, retries=0, kind="dynamic")
     if res is not None:
         try:
-            return res.json()
+            data = res.json()
+            if isinstance(data, list):
+                return data
         except Exception:
             pass
     return None
-
-
-def _fetch_eta_by_route_parallel(routes):
-    """備援方案：如果『不帶路線名稱、一次查全部路線』的 fetch_bus_data_all()
-    沒有拿到任何資料（有可能 TDX 這個 API 其實不支援這種一次查全部路線的寫法），
-    改成逐條路線平行查詢當備援——用執行緒池同時查，不是一條一條依序等，
-    確保到站資訊還是查得到，不會因為城市級 API 不支援就整個開天窗。
-    max_workers 開比較大（40）：每一條路線的查詢都帶了重試（見
-    _fetch_bus_data_from_tdx），單一請求最壞情況可能要等 15 秒以上，
-    如果平行數開太小，路線一多（台南有 80~90 條左右），加總下來很容易
-    超過後台排程 60 秒一輪的預算，反而讓『這一輪』整個拖過頭。
-    回傳 {路線名稱: [到站資訊項目, ...]}，key 直接用查詢時的路線名稱，
-    不依賴回傳資料裡有沒有正確的 RouteName 欄位。"""
-    result = {}
-    failed_routes = []
-    if not routes:
-        return result
-    with concurrent.futures.ThreadPoolExecutor(max_workers=40) as ex:
-        future_to_route = {ex.submit(_fetch_bus_data_from_tdx, r): r for r in routes}
-        for future in concurrent.futures.as_completed(future_to_route):
-            r = future_to_route[future]
-            try:
-                data = future.result()
-            except Exception:
-                data = None
-            # 特別注意 data 是 None（這次真的查詢失敗）跟 data 是 []（查詢成功，
-            # 只是這條路線目前剛好沒有任何到站預估，例如末班車已過）的差別：
-            # 只有前者才算「失敗」，需要在外層保留上一輪的舊資料；
-            # 後者是真的、最新的狀態，就應該讓它覆蓋過去，不能被當成失敗而略過。
-            if data is not None:
-                result[r] = data
-            else:
-                failed_routes.append(r)
-    if failed_routes:
-        print(f"⚠️ 這一輪到站預估查詢失敗的路線（{len(failed_routes)} 條，"
-              f"這幾條這一輪會沿用上一輪的資料，查不到才會退回時刻表估計）："
-              f"{'、'.join(failed_routes[:15])}{'…' if len(failed_routes) > 15 else ''}", flush=True)
-    return result
 
 
 def fetch_bus_data(route_name):
-    """回傳某路線的到站預估時間。改成讀『後台排程每分鐘統一抓好』的共用快照，
-    不再由每一個使用者的請求各自打一次 TDX——這樣所有使用者看到的都是同一份、
-    由後台統一更新的資料，也大幅減少對 TDX 的查詢量。
-    只有在系統剛啟動、快照完全還是空的（例如第一次部署、還沒抓過任何資料）時，
-    才退回直接查一次 TDX，避免使用者看到完全空白的畫面。"""
+    """回傳某路線的到站預估時間：只讀後台排程抓好的共用快照，絕不因為使用者查詢而打 TDX。
+    快照還沒有任何資料（剛部署、排程還沒跑第一輪）時回傳 None，上層會顯示『無法取得即時動態』。"""
     _ensure_realtime_cache_fresh()
     with _realtime_lock:
         by_route = _realtime_cache.get("eta_by_route") or {}
+        fetched = _realtime_cache.get("eta_fetched_at")
         data = by_route.get(route_name)
-        has_data = bool(by_route)
     if data is not None:
         return data
-    if has_data:
-        # 快照有資料，但這條路線剛好沒有任何一筆（可能真的沒有車在跑），
-        # 回傳空清單維持跟舊版一樣的語意，而不是回傳 None（那會被上層當成查詢失敗）。
+    if fetched or by_route:
+        # 快照有資料，但這條路線沒有任何一筆（可能真的沒有車在跑），回傳空清單
         return []
-    return _fetch_bus_data_from_tdx(route_name)
+    return None
 
 
 @cached(600)
@@ -872,49 +1072,45 @@ def fetch_weather():
     return "無法取得天氣"
 
 
-@cached(60)
+_ubike_memo = {"key": None, "stations": [], "avail": {}}
+
+
 def fetch_ubike_all():
-    stations, avail_map = [], {}
+    """回傳 (UBike 站點清單, {StationUID: 可借可還數量})。
+    站點清單來自每月 1 號存好的檔案；可借／可還數量來自『每週尖峰時段每小時抓一次』
+    存下來的快照（見 _ubike_poll_once），使用者查詢時只讀檔，不打 TDX。"""
     try:
-        r1 = requests.get("https://tdx.transportdata.tw/api/basic/v2/Bike/Station/City/Tainan?%24format=JSON",
-                           headers=tdx_headers(), timeout=8)
-        r2 = requests.get("https://tdx.transportdata.tw/api/basic/v2/Bike/Availability/City/Tainan?%24format=JSON",
-                           headers=tdx_headers(), timeout=8)
-        if r1.status_code == 200:
-            stations = r1.json()
-        if r2.status_code == 200:
-            for av in r2.json():
-                avail_map[av["StationUID"]] = av
-    except Exception:
-        pass
+        key = (os.path.getmtime(UBIKE_STATIONS_FILE) if os.path.exists(UBIKE_STATIONS_FILE) else 0,
+               os.path.getmtime(UBIKE_AVAIL_FILE) if os.path.exists(UBIKE_AVAIL_FILE) else 0)
+    except OSError:
+        key = (0, 0)
+    if _ubike_memo["key"] == key:
+        return _ubike_memo["stations"], _ubike_memo["avail"]
+    stations = _read_json_cached(UBIKE_STATIONS_FILE, [])
+    snap = _read_json_cached(UBIKE_AVAIL_FILE, {}) or {}
+    avail_map = {}
+    for av in snap.get("items", []):
+        uid = av.get("StationUID")
+        if uid:
+            avail_map[uid] = av
+    _ubike_memo.update({"key": key, "stations": stations, "avail": avail_map})
     return stations, avail_map
 
 
-@cached(300)
+def get_ubike_fetched_at():
+    """UBike 可借可還數量快照是什麼時候抓的（epoch 秒），沒有資料回傳 None。"""
+    snap = _read_json_cached(UBIKE_AVAIL_FILE, {}) or {}
+    return snap.get("fetched_at")
+
+
 def fetch_all_bus_stops():
-    url = "https://tdx.transportdata.tw/api/basic/v2/Bus/Stop/City/Tainan?%24format=JSON"
-    try:
-        res = requests.get(url, headers=tdx_headers(), timeout=20)
-        if res.status_code == 200:
-            return res.json()
-    except Exception:
-        pass
-    return []
+    """全台南站牌（附近站牌查詢用），來自每月 1 號存好的檔案，不打 TDX。"""
+    return _read_json_cached(ALL_BUS_STOPS_FILE, [])
 
 
-@cached(3600)
 def fetch_all_route_meta():
-    """取得 TDX 上台南市『所有』公車路線的正式登記資料（含正確的 RouteName）。
-    用來在使用者輸入的路線名稱查不到資料時，反查 TDX 真正登記的名稱是什麼，
-    而不是憑猜測去改設定檔。"""
-    url = "https://tdx.transportdata.tw/api/basic/v2/Bus/Route/City/Tainan?%24format=JSON"
-    try:
-        res = requests.get(url, headers=tdx_headers(), timeout=20)
-        if res.status_code == 200:
-            return res.json()
-    except Exception:
-        pass
-    return []
+    """TDX 登記的全台南路線清單（路線名稱查詢、小黃公車清單用），來自每月 1 號存好的檔案，不打 TDX。"""
+    return _read_json_cached(ALL_ROUTE_META_FILE, [])
 
 
 @cached(3600)
@@ -949,6 +1145,23 @@ def fetch_route_stop_positions(route_name):
         return []
 
 
+@cached(3600)
+def fetch_route_stop_sequences(route_name):
+    """回傳某路線『依方向、依站序』排好的站牌座標，格式 [{"dir": 0, "stops": [[lat, lon], ...]}, ...]。
+    來自每月存好的 StopOfRoute 檔案，不打 TDX。地圖上公車的『每 5 分鐘走一站』模擬移動會用到。"""
+    out = []
+    for entry in load_route_stop_data(route_name):
+        stops = sorted(entry.get("Stops", []), key=lambda s: s.get("StopSequence", 0))
+        pts = []
+        for s in stops:
+            pos = s.get("StopPosition") or {}
+            lat, lon = pos.get("PositionLat"), pos.get("PositionLon")
+            if lat and lon:
+                pts.append([round(lat, 5), round(lon, 5)])
+        if pts:
+            out.append({"dir": entry.get("Direction", 0), "stops": pts})
+    return out
+
 def fetch_shapes_and_stops_parallel(routes):
     """平行抓取多條路線的軌跡與站牌座標，避免地圖「顯示全部路線」時要序列等待上百次 API。"""
     shape_map, stop_map = {}, {}
@@ -968,47 +1181,22 @@ def fetch_shapes_and_stops_parallel(routes):
     return shape_map, stop_map
 
 
-def _fetch_bus_realtime_positions_from_tdx(route_name=None):
-    """實際向 TDX 查詢即時公車定位（RealTimeByFrequency）。
-    只給下面的後台排程呼叫，一般 API 請求改讀 fetch_bus_realtime_positions() 的共用快照。"""
-    if route_name:
-        url = f"https://tdx.transportdata.tw/api/basic/v2/Bus/RealTimeByFrequency/City/Tainan/{route_name}?%24format=JSON"
-    else:
-        url = "https://tdx.transportdata.tw/api/basic/v2/Bus/RealTimeByFrequency/City/Tainan?%24format=JSON"
-    res = tdx_get(url, timeout=25, retries=1)
-    if res is not None:
-        try:
-            return res.json()
-        except Exception:
-            pass
-    return []
-
-
-def fetch_bus_realtime_positions(route_name=None):
-    """回傳即時公車 GPS 定位（不帶路線名稱＝全台南所有路線）。改成讀『後台排程
-    每分鐘統一抓好』的共用快照，不再由每一個使用者的請求各自打一次 TDX。
-    只有在系統剛啟動、快照完全還是空的時候，才退回直接查一次 TDX 當暫時的資料來源。"""
-    _ensure_realtime_cache_fresh()
-    with _realtime_lock:
-        by_route = _realtime_cache.get("positions_by_route") or {}
-        has_data = bool(by_route)
-        if route_name:
-            result = list(by_route.get(route_name, []))
-        else:
-            result = [b for lst in by_route.values() for b in lst]
-    if has_data:
-        return result
-    return _fetch_bus_realtime_positions_from_tdx(route_name)
-
-
-# ── 即時公車資料（定位／到站預估）：後台每分鐘統一抓一次的共用快照 ─────────
-# 目的：所有使用者都讀同一份、由後台排程統一更新的資料，而不是每個人的每一次
-# 請求都各自向 TDX 發送請求；同時把這份快照存檔＋推到 GitHub 的獨立分支，
-# 即使 Render 重啟、換機器，也能立刻拿回上一次成功抓到的資料。
+# ── 即時資料（到站預估／公車定位／UBike）：後台排程＋共用快照 ─────────────────
+# 設計重點（為了把 TDX 用量壓在每月 2800 次以下）：
+#   ① 到站預估（含車牌車型）：後台排程依時段抓『全台南一次』＝ 1 次請求。
+#        尖峰（週一～五 07:00-08:00、17:00-18:00）每 6 分鐘；
+#        平常（週一～五 05:50-07:00、08:00-17:00、18:00-23:00）每 15 分鐘；
+#        週末 05:50-23:00 每 20 分鐘；23:00-05:50 完全不抓。
+#        兩次抓取之間，API 與前端會用「現在時間 － 抓取時間」自動往下修正倒數。
+#   ② UBike 可借可還：只在週一～五尖峰時段，每小時抓 1 次（每個尖峰時段 1 次）。
+#   ③ 公車定位（地圖）：沒有人開地圖就完全不抓；有人開、而快照超過 1 小時才抓 1 次，
+#        兩次之間由前端自己讓公車沿路線每 5 分鐘走一站。
 REALTIME_POSITIONS_FILE = os.path.join(REALTIME_DATA_DIR, "positions.json")
 REALTIME_ETA_FILE = os.path.join(REALTIME_DATA_DIR, "eta.json")
 REALTIME_META_FILE = os.path.join(REALTIME_DATA_DIR, "meta.json")
 REALTIME_LOCK_FILE = os.path.join(REALTIME_DATA_DIR, ".poll.lock")
+REALTIME_POS_LOCK_FILE = os.path.join(REALTIME_DATA_DIR, ".positions.lock")
+REALTIME_UBIKE_LOCK_FILE = os.path.join(REALTIME_DATA_DIR, ".ubike.lock")
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
 
@@ -1018,13 +1206,18 @@ def _taipei_now():
     return datetime.now(TAIPEI_TZ)
 
 
-# ── 智慧輪詢時刻表：首末班車、尖峰／離峰、深夜收班 ──────────────────
-SERVICE_START = (5, 30)   # 05:30 首班車
-SERVICE_END = (23, 0)     # 23:00 末班車
-PEAK_WINDOWS = [((6, 0), (8, 0)), ((17, 0), (19, 0))]  # 上下班／放學尖峰
-PEAK_INTERVAL_SECONDS = 6 * 60     # 尖峰每 6 分鐘抓一次
-OFFPEAK_INTERVAL_SECONDS = 15 * 60  # 離峰每 15 分鐘抓一次
-SERVICE_CLOSED_MESSAGE = "🌙 末班車已收車，明日 05:30 恢復發車"
+# ── 智慧輪詢時刻表 ────────────────────────────────────────
+SERVICE_START = (5, 50)   # 05:50 首班車（之前的查詢時間點）
+SERVICE_END = (23, 0)     # 23:00 末班車之後停止取資料
+WEEKDAY_PEAK_WINDOWS = [((7, 0), (8, 0)), ((17, 0), (18, 0))]   # 週一～五尖峰
+PEAK_INTERVAL_SECONDS = 6 * 60        # 尖峰每 6 分鐘
+OFFPEAK_INTERVAL_SECONDS = 15 * 60    # 平常時段每 15 分鐘
+WEEKEND_INTERVAL_SECONDS = 20 * 60    # 週末（你沒指定，預設 20 分鐘，想改直接改這個數字）
+UBIKE_REFRESH_SECONDS = 3600          # 尖峰時段 UBike 每小時一次
+POSITIONS_REFRESH_SECONDS = 3600      # 有人用地圖時，公車定位每小時抓一次
+POSITIONS_RETRY_COOLDOWN = 300        # 定位抓取失敗後，至少隔 5 分鐘才再試（避免每次點地圖都燒一次額度）
+POSITIONS_GPS_FALLBACK_MAX_AGE = 10 * 60   # 「查詢頁」只有在定位快照 10 分鐘內才拿來補站上有車
+SERVICE_CLOSED_MESSAGE = "🌙 末班車已收車，明日 05:50 恢復發車"
 
 
 def _minutes_of(t):
@@ -1033,7 +1226,7 @@ def _minutes_of(t):
 
 def _in_window(now, start, end):
     m = _minutes_of(now)
-    return _minutes_of(datetime(2000, 1, 1, *start)) <= m < _minutes_of(datetime(2000, 1, 1, *end))
+    return start[0] * 60 + start[1] <= m < end[0] * 60 + end[1]
 
 
 def is_service_hours(now=None):
@@ -1041,21 +1234,30 @@ def is_service_hours(now=None):
     return _in_window(now, SERVICE_START, SERVICE_END)
 
 
+def is_weekday(now=None):
+    return (now or _taipei_now()).weekday() < 5
+
+
+def is_peak_time(now=None):
+    """週一～五的尖峰時段（07:00-08:00、17:00-18:00）。"""
+    now = now or _taipei_now()
+    return is_weekday(now) and any(_in_window(now, s, e) for s, e in WEEKDAY_PEAK_WINDOWS)
+
+
 def get_smart_poll_interval(now=None):
-    """回傳現在這一刻該用的輪詢間隔秒數；深夜收班時段回傳 None，
-    代表這一輪完全不要向 TDX 發任何請求（額度歸零）。"""
+    """回傳現在這一刻『到站預估』該用的輪詢間隔秒數；23:00-05:50 回傳 None，
+    代表完全不要向 TDX 發任何請求。"""
     now = now or _taipei_now()
     if not is_service_hours(now):
         return None
-    for start, end in PEAK_WINDOWS:
-        if _in_window(now, start, end):
-            return PEAK_INTERVAL_SECONDS
+    if not is_weekday(now):
+        return WEEKEND_INTERVAL_SECONDS
+    if is_peak_time(now):
+        return PEAK_INTERVAL_SECONDS
     return OFFPEAK_INTERVAL_SECONDS
 
 
 def _seconds_until_service_resumes(now=None):
-    """深夜收班時，算出距離明天／今天 05:30 還有幾秒，讓背景執行緒可以直接一次
-    睡到該恢復發車的時間點，不用每分鐘醒來白白檢查。"""
     now = now or _taipei_now()
     resume = now.replace(hour=SERVICE_START[0], minute=SERVICE_START[1], second=0, microsecond=0)
     if resume <= now:
@@ -1063,81 +1265,72 @@ def _seconds_until_service_resumes(now=None):
     return max(30, (resume - now).total_seconds())
 
 
-REALTIME_STALE_SECONDS = 20 * 60  # 超過這個秒數還沒成功更新過，視為「尚未更新資料」（配合最長 15 分鐘的離峰間隔）
-REALTIME_PUSH_MIN_INTERVAL = 5 * 60  # 記憶體／本機檔案每輪都更新沒關係，但推送到 GitHub 至少間隔這麼多秒才真的推送一次
+REALTIME_STALE_SECONDS = 40 * 60   # 超過這個秒數沒成功更新到站預估，視為「尚未更新資料」（最長間隔 20 分鐘的兩倍）
+REALTIME_PUSH_MIN_INTERVAL = 5 * 60  # 推送到 GitHub 的節流
 
 _realtime_lock = threading.Lock()
+_positions_fetch_lock = threading.Lock()
 _realtime_cache = {
     "positions_by_route": {},
     "eta_by_route": {},
-    "updated_at": None,       # 最近一次「成功」更新的時間
-    "eta_fetched_at": None,   # 最近一次成功更新 eta_by_route 的時間戳（epoch 秒），給前端算即時倒數用
-    "last_attempt": None,     # 最近一次「嘗試」更新的時間（不管成功與否）
+    "updated_at": None,            # 最近一次「成功」更新到站預估的時間字串
+    "eta_fetched_at": None,        # 最近一次成功抓到到站預估的時間（epoch 秒）
+    "positions_fetched_at": None,  # 最近一次成功抓到公車定位的時間（epoch 秒）
+    "last_attempt": None,
+    "last_attempt_ts": None,       # 最近一次「嘗試」抓到站預估的時間（epoch 秒，失敗也算，用來控制重試間隔）
     "last_attempt_ok": None,
-    "service_closed": False,  # 是否在深夜收班時段（此時完全不打 TDX）
+    "service_closed": False,
 }
-_realtime_file_mtime = None  # 記憶體裡這份快照，是對應到「檔案」的哪個修改時間
-_last_realtime_push_at = 0   # 上一次真的推送到 GitHub 的時間戳（節流用，見 REALTIME_PUSH_MIN_INTERVAL）
+_realtime_file_mtime = None
+_last_realtime_push_at = 0
+_positions_last_attempt = 0
+_ubike_last_attempt = 0
 
 
 def get_realtime_status():
-    """回傳目前這份共用快照的新鮮度，給 API 附加在回應裡，讓前端可以在資料
-    太舊（代表後台排程可能連續失敗）時顯示「尚未更新資料」，而不是讓使用者
-    誤以為看到的一定是最新狀態。同時附上 service_closed（是否深夜收班中）
-    跟 eta_fetched_at（epoch 秒，給前端算即時倒數用）。"""
+    """回傳到站預估快照的新鮮度，給 API 附加在回應裡。"""
     with _realtime_lock:
         updated_at = _realtime_cache.get("updated_at")
         service_closed = bool(_realtime_cache.get("service_closed"))
         eta_fetched_at = _realtime_cache.get("eta_fetched_at")
-    if not updated_at:
-        return {"updated_at": None, "is_fresh": False, "age_seconds": None,
-                "service_closed": service_closed, "eta_fetched_at": eta_fetched_at}
-    try:
-        updated_dt = datetime.strptime(updated_at, "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return {"updated_at": updated_at, "is_fresh": False, "age_seconds": None,
-                "service_closed": service_closed, "eta_fetched_at": eta_fetched_at}
-    age = (datetime.now() - updated_dt).total_seconds()
-    return {"updated_at": updated_at, "is_fresh": age <= REALTIME_STALE_SECONDS, "age_seconds": int(age),
-            "service_closed": service_closed, "eta_fetched_at": eta_fetched_at}
+        positions_fetched_at = _realtime_cache.get("positions_fetched_at")
+    base = {"updated_at": updated_at, "is_fresh": False, "age_seconds": None,
+            "service_closed": service_closed, "eta_fetched_at": eta_fetched_at,
+            "positions_fetched_at": positions_fetched_at}
+    if eta_fetched_at:
+        age = time.time() - eta_fetched_at
+        base.update({"is_fresh": age <= REALTIME_STALE_SECONDS, "age_seconds": int(age)})
+    return base
 
 
 def _load_realtime_cache_from_disk():
-    """伺服器剛啟動時，把上一次存檔（可能是這台機器自己存的，也可能是剛剛從
-    GitHub realtime-data 分支拉回來的）讀進記憶體，讓系統一開機就有資料可用，
-    不用整整等到第一次排程（最多 1 分鐘）跑完才有東西可以顯示。"""
+    """把存檔的快照讀進記憶體（開機、或別的 worker 更新了檔案時）。"""
     positions_by_route, eta_by_route, meta = {}, {}, {}
-    try:
-        with open(REALTIME_POSITIONS_FILE, "r", encoding="utf-8") as f:
-            positions_by_route = json.load(f)
-    except Exception:
-        pass
-    try:
-        with open(REALTIME_ETA_FILE, "r", encoding="utf-8") as f:
-            eta_by_route = json.load(f)
-    except Exception:
-        pass
-    try:
-        with open(REALTIME_META_FILE, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-    except Exception:
-        pass
+    for path, name in ((REALTIME_POSITIONS_FILE, "p"), (REALTIME_ETA_FILE, "e"), (REALTIME_META_FILE, "m")):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            if name == "p":
+                positions_by_route = obj
+            elif name == "e":
+                eta_by_route = obj
+            else:
+                meta = obj
+        except Exception:
+            pass
     with _realtime_lock:
         _realtime_cache["positions_by_route"] = positions_by_route
         _realtime_cache["eta_by_route"] = eta_by_route
         _realtime_cache["updated_at"] = meta.get("updated_at")
+        _realtime_cache["eta_fetched_at"] = meta.get("eta_fetched_at")
+        _realtime_cache["positions_fetched_at"] = meta.get("positions_fetched_at")
         _realtime_cache["last_attempt"] = meta.get("last_attempt")
+        _realtime_cache["last_attempt_ts"] = meta.get("last_attempt_ts")
         _realtime_cache["last_attempt_ok"] = meta.get("last_attempt_ok")
 
 
 def _ensure_realtime_cache_fresh():
-    """真正讓『使用者查詢一律從檔案抓資料』成立的關鍵：每次查詢前，先看一下
-    快照檔案（meta.json）的修改時間有沒有變新——不管是這個處理程序自己的
-    後台排程剛更新的，還是（部署成多個 worker process 時）另一個 worker
-    process 的排程更新的，只要檔案變新了，就重新讀一次檔案進記憶體。
-    平常檔案沒變的話，這裡只做一次很輕量的 os.stat()，不會整個重新讀寫，
-    所以正常查詢速度完全不受影響；但只要檔案有變，查詢一定拿到『檔案裡
-    最新那份』，不會有某個 worker 記憶體裡卡著舊資料的問題。"""
+    """每次讀快照前，先看 meta.json 的修改時間：別的 worker 更新過就重新讀檔，沒變就什麼都不做。"""
     global _realtime_file_mtime
     try:
         mtime = os.path.getmtime(REALTIME_META_FILE)
@@ -1148,47 +1341,47 @@ def _ensure_realtime_cache_fresh():
         _realtime_file_mtime = mtime
 
 
-def _acquire_realtime_poll_lock():
-    """如果之後改成多個 worker process 部署，避免每個 worker 都各自每分鐘
-    去打一次 TDX、各自 git push（互相打架、也失去『統一由後台抓一次』的意義）。
-    用 flock 非阻塞鎖：同一時間只有搶到鎖的那個 worker 真的去查 TDX、寫檔、
-    推送到 GitHub，其他 worker 這一輪直接跳過——反正上面的
-    _ensure_realtime_cache_fresh() 會讓它們之後查詢時，照樣讀得到別人剛剛
-    寫進（同一顆磁碟上）檔案裡的最新資料。單一 worker 部署時，這裡幾乎不會
-    有任何影響，每次都馬上搶得到鎖。"""
+def _acquire_flock(path):
+    """跨 worker 的非阻塞鎖：搶到回傳檔案物件，沒搶到（別人正在抓）回傳 None。"""
+    fp = None
     try:
-        os.makedirs(REALTIME_DATA_DIR, exist_ok=True)
-        fp = open(REALTIME_LOCK_FILE, "w")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fp = open(path, "w")
         fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         return fp
     except BlockingIOError:
-        fp.close()
+        if fp:
+            fp.close()
         return None
     except Exception:
-        return None
+        return fp   # 檔案系統有問題時照常執行（單 worker 情況不影響）
 
 
-def _write_realtime_snapshot(positions_by_route, eta_by_route, ok, attempted_at):
-    """把這一輪抓到的定位／到站資料寫檔：每次都先刪掉舊檔，再整批寫入新的，
-    確保資料夾裡永遠只留『最新這一份』快照，而不是累加、保留歷史檔案。"""
+def _release_flock(fp):
+    if fp is None:
+        return
+    try:
+        fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    fp.close()
+
+
+def _write_realtime_snapshot(write_eta=False, write_positions=False):
+    """把記憶體裡最新的快照寫成檔案（原子替換，讀的人不會讀到寫一半的檔）。meta.json 最後寫。"""
     global _realtime_file_mtime
     try:
-        os.makedirs(REALTIME_DATA_DIR, exist_ok=True)
-        for path in (REALTIME_POSITIONS_FILE, REALTIME_ETA_FILE, REALTIME_META_FILE):
-            if os.path.exists(path):
-                os.remove(path)
-        with open(REALTIME_POSITIONS_FILE, "w", encoding="utf-8") as f:
-            json.dump(positions_by_route, f, ensure_ascii=False)
-        with open(REALTIME_ETA_FILE, "w", encoding="utf-8") as f:
-            json.dump(eta_by_route, f, ensure_ascii=False)
-        with open(REALTIME_META_FILE, "w", encoding="utf-8") as f:
-            json.dump({
-                "updated_at": _realtime_cache.get("updated_at"),
-                "last_attempt": attempted_at,
-                "last_attempt_ok": ok,
-            }, f, ensure_ascii=False)
-        # 這個 process 剛剛自己寫過檔案了，記憶體裡就是最新的，記下這個檔案時間，
-        # 避免下一次查詢時 _ensure_realtime_cache_fresh() 又白白重讀一次同樣的內容。
+        with _realtime_lock:
+            positions = dict(_realtime_cache["positions_by_route"])
+            eta = dict(_realtime_cache["eta_by_route"])
+            meta = {k: _realtime_cache.get(k) for k in (
+                "updated_at", "eta_fetched_at", "positions_fetched_at",
+                "last_attempt", "last_attempt_ts", "last_attempt_ok")}
+        if write_positions:
+            _atomic_write_json(REALTIME_POSITIONS_FILE, positions)
+        if write_eta:
+            _atomic_write_json(REALTIME_ETA_FILE, eta)
+        _atomic_write_json(REALTIME_META_FILE, meta)
         try:
             _realtime_file_mtime = os.path.getmtime(REALTIME_META_FILE)
         except OSError:
@@ -1197,73 +1390,44 @@ def _write_realtime_snapshot(positions_by_route, eta_by_route, ok, attempted_at)
         print(f"⚠️ 寫入即時資料快照失敗：{e}", flush=True)
 
 
-def _realtime_poll_once():
-    """後台排程主體：每分鐘執行一次，統一向 TDX 抓『全台南公車即時定位』與
-    『全台南到站預估時間』各一次（各只發一次請求，不是每條路線各發一次），
-    取代原本每個使用者查詢時都各自打一次 TDX 的做法。
-    抓到之後：① 依路線名稱分組、更新記憶體共用快取 ② 存檔（先清舊檔再整批換新）
-    ③ 推送到 bus_app.py3.0backup 這個 repo 的 realtime-data 分支。
-    只要這一輪完全沒抓到任何資料，就不更新 updated_at，讓 get_realtime_status()
-    能正確判斷『已經有一段時間沒有成功更新』，回傳給前端顯示「尚未更新資料」。
-    最前面先搶跨處理程序的鎖：部署成多個 worker process 時，只有搶到鎖的那個
-    worker 真的執行這一輪，其他 worker 直接跳過，避免大家都各自打一次 TDX。"""
-    lock_fp = _acquire_realtime_poll_lock()
+# ── ① 到站預估 ────────────────────────────────────────────
+def _eta_poll_due(interval):
+    """距離上一次『嘗試』是否已經超過這個時段該有的間隔（成功失敗都算嘗試）。
+    以共用檔案裡的時間為準，多個 worker 不會各抓各的。"""
+    _ensure_realtime_cache_fresh()
+    with _realtime_lock:
+        last = max(_realtime_cache.get("eta_fetched_at") or 0, _realtime_cache.get("last_attempt_ts") or 0)
+    return time.time() - last >= interval - 5
+
+
+def _eta_poll_once(interval):
+    """向 TDX 抓『全台南到站預估』1 次（含每站車牌／車型），存進快照。"""
+    lock_fp = _acquire_flock(REALTIME_LOCK_FILE)
     if lock_fp is None:
-        return  # 已經有別的 worker 正在跑這一輪，這裡不用重複做
+        return False
     try:
+        if not _eta_poll_due(interval):   # 搶到鎖之後再確認一次，避免別的 worker 剛抓完
+            return False
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        positions_all = _fetch_bus_realtime_positions_from_tdx(None)
-
-        positions_by_route = {}
-        for b in (positions_all or []):
-            r = (b.get("RouteName") or {}).get("Zh_tw", "")
-            if r:
-                positions_by_route.setdefault(r, []).append(b)
-
         eta_all = fetch_bus_data_all()
-        eta_source = "city-wide"
-        if eta_all:
-            eta_by_route = {}
-            for item in eta_all:
-                r = (item.get("RouteName") or {}).get("Zh_tw", "")
-                if r:
-                    eta_by_route.setdefault(r, []).append(item)
-        else:
-            # 城市級「一次查全部路線」沒有拿到資料，改成逐條路線平行查詢當備援，
-            # 確保到站資訊還是查得到，不會讓 fetch_bus_data() 一直讀到空快取，
-            # 進而每個使用者的請求又被迫退回去直接查一次 TDX（那才是真正會讓
-            # 頁面『跑很久』的原因）。
-            eta_source = "per-route fallback"
-            eta_by_route = _fetch_eta_by_route_parallel(get_all_known_routes())
-
-        ok = bool(positions_all) or bool(eta_by_route)
-
+        ok = eta_all is not None
         with _realtime_lock:
-            if positions_all:
-                _realtime_cache["positions_by_route"] = positions_by_route
-            if eta_by_route:
-                # 用「合併」而不是整批覆蓋：這一輪如果只有部分路線查詢失敗
-                # （例如逐條路線平行查詢時，剛好某幾條逾時），失敗的路線保留
-                # 上一輪的舊資料，不要因為這一輪剛好沒查到，就讓它整個從快取
-                # 消失、被迫顯示成「尚未發車」甚至退回時刻表估計。
-                merged_eta = dict(_realtime_cache.get("eta_by_route") or {})
-                merged_eta.update(eta_by_route)
-                _realtime_cache["eta_by_route"] = merged_eta
-                _realtime_cache["eta_fetched_at"] = time.time()
             if ok:
+                eta_by_route = {}
+                for item in eta_all:
+                    r = (item.get("RouteName") or {}).get("Zh_tw", "")
+                    if r:
+                        eta_by_route.setdefault(r, []).append(item)
+                # 成功就整批換新（舊的已經收班或過站的車就該消失）
+                _realtime_cache["eta_by_route"] = eta_by_route
+                _realtime_cache["eta_fetched_at"] = time.time()
                 _realtime_cache["updated_at"] = now_str
             _realtime_cache["last_attempt"] = now_str
+            _realtime_cache["last_attempt_ts"] = time.time()
             _realtime_cache["last_attempt_ok"] = ok
-            snapshot_positions = dict(_realtime_cache["positions_by_route"])
-            snapshot_eta = dict(_realtime_cache["eta_by_route"])
+            count = sum(len(v) for v in (_realtime_cache["eta_by_route"] or {}).values())
+        _write_realtime_snapshot(write_eta=ok)
 
-        _write_realtime_snapshot(snapshot_positions, snapshot_eta, ok, now_str)
-
-        # 記憶體／本機檔案每輪都更新沒關係，但推送到 GitHub 沒必要跟著尖峰的
-        # 6 分鐘一輪跑，那只是給「Render 重啟後找回上次資料」用的備份，不是
-        # 使用者查詢會用到的路徑，這裡節流成至少間隔 REALTIME_PUSH_MIN_INTERVAL
-        # 秒才真的推送一次。
         global _last_realtime_push_at
         if time.time() - _last_realtime_push_at >= REALTIME_PUSH_MIN_INTERVAL:
             try:
@@ -1272,48 +1436,161 @@ def _realtime_poll_once():
             except Exception as e:
                 print(f"❌ 即時資料推送到 GitHub 失敗：{e}", flush=True)
 
-        print(f"{'✅' if ok else '⚠️'} 即時公車資料排程：定位 {len(positions_all or [])} 筆、"
-              f"到站預估 {sum(len(v) for v in eta_by_route.values())} 筆（來源：{eta_source}），"
-              f"時間 {now_str}", flush=True)
+        used = tdx_usage_snapshot().get("count", 0)
+        print(f"{'✅' if ok else '⚠️'} 到站預估排程：{count} 筆，時間 {now_str}，"
+              f"本月 TDX 已用 {used}/{TDX_MONTHLY_CAP}", flush=True)
+        return ok
     finally:
+        _release_flock(lock_fp)
+
+
+# ── ② UBike（只在週一～五尖峰時段，每小時 1 次）──────────────
+def _ubike_poll_due(now):
+    if not is_peak_time(now):
+        return False
+    if time.time() - _ubike_last_attempt < 600:   # 失敗後 10 分鐘內不重試
+        return False
+    fetched = get_ubike_fetched_at() or 0
+    return time.time() - fetched >= UBIKE_REFRESH_SECONDS - 5
+
+
+def _ubike_poll_once():
+    global _ubike_last_attempt
+    lock_fp = _acquire_flock(REALTIME_UBIKE_LOCK_FILE)
+    if lock_fp is None:
+        return
+    try:
+        fetched = get_ubike_fetched_at() or 0
+        if time.time() - fetched < UBIKE_REFRESH_SECONDS - 5:
+            return
+        _ubike_last_attempt = time.time()
+        url = "https://tdx.transportdata.tw/api/basic/v2/Bike/Availability/City/Tainan?%24format=JSON"
+        res = tdx_get(url, timeout=20, retries=0, kind="dynamic")
+        if res is None:
+            return
         try:
-            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
+            items = res.json()
+        except Exception:
+            return
+        if isinstance(items, list) and items:
+            _atomic_write_json(UBIKE_AVAIL_FILE, {"fetched_at": time.time(), "items": items})
+            print(f"🚲 UBike 可借可還更新：{len(items)} 站", flush=True)
+    finally:
+        _release_flock(lock_fp)
+
+
+# ── ③ 公車定位（只有地圖有人用才抓）────────────────────────
+def _fetch_bus_realtime_positions_from_tdx():
+    """向 TDX 查『全台南』即時公車定位 1 次。失敗回傳 None。"""
+    url = "https://tdx.transportdata.tw/api/basic/v2/Bus/RealTimeByFrequency/City/Tainan?%24format=JSON"
+    res = tdx_get(url, timeout=30, retries=0, kind="dynamic")
+    if res is not None:
+        try:
+            data = res.json()
+            if isinstance(data, list):
+                return data
         except Exception:
             pass
-        lock_fp.close()
+    return None
 
 
-def _realtime_poll_loop():
-    """智慧輪詢排程：
-      - 05:30～23:00 營運時間內，尖峰（6-8點／17-19點）每 6 分鐘查一次 TDX，
-        離峰每 15 分鐘查一次，取代原本固定頻率的做法，節省 TDX 額度。
-      - 23:00～05:30 深夜收班時段，完全不打 TDX（額度歸零），把快照標記成
-        service_closed，前端據此顯示「末班車已收車」，並直接一次睡到 05:30，
-        不用每分鐘醒來白檢查。
-    跟現有備份路線資料用的 backup_loop／scheduler_thread 是各自獨立的排程執行緒，
-    互不影響。"""
-    while True:
+def ensure_positions_fresh_for_map():
+    """地圖 API 呼叫：有人在用地圖，而且定位快照已經超過 1 小時，才向 TDX 抓 1 次；
+    收班時段（23:00-05:50）完全不抓。沒有人開地圖就永遠不會被呼叫＝不耗額度。
+    回傳 {'service_closed': bool, 'fetched_at': epoch 或 None}。"""
+    global _positions_last_attempt
+    _ensure_realtime_cache_fresh()
+    if not is_service_hours():
+        return {"service_closed": True, "fetched_at": None}
+
+    def current():
+        with _realtime_lock:
+            return _realtime_cache.get("positions_fetched_at")
+
+    fetched = current()
+    if fetched and time.time() - fetched < POSITIONS_REFRESH_SECONDS:
+        return {"service_closed": False, "fetched_at": fetched}
+    if time.time() - _positions_last_attempt < POSITIONS_RETRY_COOLDOWN:
+        return {"service_closed": False, "fetch_skipped": True, "fetched_at": fetched}
+    # 用量進度檢查比到站預估「更嚴格」（緩衝 0 次，到站預估是 150 次）：
+    # 額度吃緊時先犧牲地圖定位更新，保住到站預估，整個月才不會在月底提早用完。
+    if not _pacing_allows_optional_poll(margin=0):
+        return {"service_closed": False, "fetch_skipped": True, "fetched_at": fetched}
+
+    with _positions_fetch_lock:
+        _ensure_realtime_cache_fresh()
+        fetched = current()
+        if fetched and time.time() - fetched < POSITIONS_REFRESH_SECONDS:
+            return {"service_closed": False, "fetched_at": fetched}
+        lock_fp = _acquire_flock(REALTIME_POS_LOCK_FILE)
+        if lock_fp is None:      # 別的 worker 正在抓，這裡直接用現有快照
+            return {"service_closed": False, "fetched_at": fetched}
         try:
-            interval = get_smart_poll_interval()
+            _positions_last_attempt = time.time()
+            positions_all = _fetch_bus_realtime_positions_from_tdx()
+            if positions_all is not None:
+                by_route = {}
+                for b in positions_all:
+                    r = (b.get("RouteName") or {}).get("Zh_tw", "")
+                    if r:
+                        by_route.setdefault(r, []).append(b)
+                with _realtime_lock:
+                    _realtime_cache["positions_by_route"] = by_route
+                    _realtime_cache["positions_fetched_at"] = time.time()
+                _write_realtime_snapshot(write_positions=True)
+                print(f"🗺️ 地圖有人使用，公車定位更新：{len(positions_all)} 台", flush=True)
+        finally:
+            _release_flock(lock_fp)
+    return {"service_closed": False, "fetched_at": current()}
+
+
+def get_positions_snapshot(route_name=None, max_age=None):
+    """讀『已經存在的』公車定位快照（不會打 TDX）。max_age（秒）：快照比這個舊就當作沒有。"""
+    _ensure_realtime_cache_fresh()
+    with _realtime_lock:
+        by_route = _realtime_cache.get("positions_by_route") or {}
+        fetched = _realtime_cache.get("positions_fetched_at")
+        if max_age is not None and (not fetched or time.time() - fetched > max_age):
+            return []
+        if route_name:
+            return list(by_route.get(route_name, []))
+        return [b for lst in by_route.values() for b in lst]
+
+
+# ── 背景排程主迴圈 ────────────────────────────────────────
+def _realtime_poll_loop():
+    """每 20 秒醒來看一次「現在該不該抓」（不是睡整段間隔），所以從平常時段切進尖峰時，
+    會在 07:00／17:00 準時開始用 6 分鐘節奏，不會晚一大段。
+      - 到站預估：依 get_smart_poll_interval() 的間隔；平常／週末時段還要過用量進度檢查。
+      - UBike：週一～五尖峰時段每小時 1 次。
+      - 靜態資料：每小時檢查一次本月是否已更新（每月 1 號或當月首次啟動時才真的抓）。
+      - 23:00-05:50：不打任何即時資料請求。"""
+    last_static_check = 0
+    while True:
+        sleep_s = 20
+        try:
+            now = _taipei_now()
+            if time.time() - last_static_check >= 3600:
+                last_static_check = time.time()
+                threading.Thread(target=refresh_static_data, daemon=True).start()
+            interval = get_smart_poll_interval(now)
             if interval is None:
                 with _realtime_lock:
                     _realtime_cache["service_closed"] = True
-                sleep_s = _seconds_until_service_resumes()
-                print(f"🌙 深夜收班時段，暫停向 TDX 查詢，{sleep_s/3600:.1f} 小時後（05:30）恢復。", flush=True)
-                time.sleep(sleep_s)
-                continue
-            with _realtime_lock:
-                _realtime_cache["service_closed"] = False
-            _realtime_poll_once()
+                sleep_s = min(_seconds_until_service_resumes(now), 1800)
+            else:
+                with _realtime_lock:
+                    _realtime_cache["service_closed"] = False
+                if _eta_poll_due(interval) and (is_peak_time(now) or _pacing_allows_optional_poll(now)):
+                    _eta_poll_once(interval)
+                if _ubike_poll_due(now):
+                    _ubike_poll_once()
         except Exception as e:
             print(f"❌ 即時資料排程發生例外：{e}", flush=True)
-            interval = OFFPEAK_INTERVAL_SECONDS
-        time.sleep(interval)
+        time.sleep(sleep_s)
 
 
 _load_realtime_cache_from_disk()
-realtime_thread = threading.Thread(target=_realtime_poll_loop, daemon=True)
-realtime_thread.start()
 
 
 def find_nearby_stops(all_stops, lat, lon, radius_km=0.5):
@@ -1750,6 +2027,14 @@ def api_route_status():
     if bus_list is None:
         return jsonify({"error": "無法取得即時動態"}), 502
 
+    # 到站預估是後台排程「抓取當下」的數字（尖峰 6 分鐘、平常 15 分鐘、週末 20 分鐘才更新一次），
+    # 這裡依「現在 － 抓取時間」把每一站的剩餘秒數往下修正，使用者每次查詢（前端每分鐘會重新查）
+    # 看到的都是『現在』的預估時間，而不是抓取當下那個已經過時的數字。
+    _rt = get_realtime_status()
+    eta_elapsed = max(0.0, time.time() - _rt["eta_fetched_at"]) if _rt["eta_fetched_at"] else 0.0
+    if eta_elapsed > REALTIME_STALE_SECONDS:
+        bus_list = []   # 快照太舊（例如隔夜、排程連續失敗），不拿來推算，避免所有站都變成「即將進站」
+
     dir0 = sorted([x for x in bus_list if x.get("Direction") == 0], key=lambda x: x.get('StopSequence', 0))
     dir1 = sorted([x for x in bus_list if x.get("Direction") == 1], key=lambda x: x.get('StopSequence', 0))
     dest_0 = dir0[-1].get("StopName", {}).get("Zh_tw", "去程") if dir0 else "去程"
@@ -1767,6 +2052,9 @@ def api_route_status():
         stop_coord_map[sp["name"]] = (sp["lat"], sp["lon"])
 
     ub_stations, ub_avail = fetch_ubike_all()
+    # UBike 車數只在週一～五尖峰時段每小時更新一次，其餘時間是舊資料，一定要讓使用者知道是幾點的
+    _ub_ts = get_ubike_fetched_at()
+    ubike_hm = datetime.fromtimestamp(_ub_ts, TAIPEI_TZ).strftime("%m/%d %H:%M") if _ub_ts else ""
     realtime_map = {item.get("StopName", {}).get("Zh_tw", ""): item for item in active_list}
     all_stops_raw = fetch_route_stops_by_direction(route, target_dir)
     full_stop_list = all_stops_raw or [item.get("StopName", {}).get("Zh_tw", "") for item in active_list]
@@ -1778,9 +2066,15 @@ def api_route_status():
     # 尤其班次少、或車輛剛好在兩站中間時，容易讓明明有車在跑的站被判定成「尚未發車」。
     # 這裡另外抓「即時公車 GPS 定位」（RealTimeByFrequency，跟地圖用的是同一支端點），
     # 用最近站的方式回頭比對，確保只要 TDX 查得到這班車，時間軸上就不會漏掉它。
-    gps_buses = fetch_bus_realtime_positions(route)
+    # 公車定位快照只有「有人開地圖」時才會每小時更新，所以這裡只採信 10 分鐘內的快照，
+    # 太舊的定位拿來判斷「站上有車」會誤報，寧可不用。
+    gps_buses = get_positions_snapshot(route, max_age=POSITIONS_GPS_FALLBACK_MAX_AGE)
     gps_dir_buses = [b for b in gps_buses if b.get("Direction", 0) == target_dir]
-    active_bus_count = len(gps_dir_buses)
+    # 營運中的車輛數改用到站預估資料裡出現的「不重複車牌」來算（不依賴很少更新的 GPS 定位）
+    active_bus_count = len({
+        it.get("PlateNumb") for it in active_list
+        if it.get("PlateNumb") and it.get("PlateNumb") not in ("🧱", "無車牌", "-1")
+    })
     gps_near_stop = {}
     for b in gps_dir_buses:
         pos = b.get("BusPosition", {})
@@ -1799,7 +2093,8 @@ def api_route_status():
     ubike_suggestion = None
     if start_st and end_st and start_st != end_st:
         start_item = realtime_map.get(start_st, {})
-        bus_wait = start_item.get("EstimateTime") or 0
+        _raw_wait = start_item.get("EstimateTime")
+        bus_wait = max(0, _raw_wait - eta_elapsed) if _raw_wait is not None else 0
         if start_st in full_stop_list and end_st in full_stop_list:
             idx_s = full_stop_list.index(start_st)
             idx_e = full_stop_list.index(end_st)
@@ -1808,6 +2103,8 @@ def api_route_status():
             bus_travel = 600
         ubike_suggestion = check_ubike_suggestion(
             start_st, end_st, stop_coord_map, ub_stations, ub_avail, bus_wait, bus_travel)
+        if ubike_suggestion and ubike_hm:
+            ubike_suggestion += f"\n（UBike 車數為 {ubike_hm} 的資料，僅供參考）"
 
     tts_lines = [f"路線 {route}，往 {dest_0 if direction == '去程' else dest_1}方向。"]
     stops_out = []
@@ -1822,6 +2119,8 @@ def api_route_status():
     for idx, s_name in enumerate(full_stop_list):
         item = realtime_map.get(s_name, {})
         eta = item.get("EstimateTime")
+        if eta is not None:
+            eta = max(0, eta - eta_elapsed)   # 修正成「現在」的剩餘秒數
         status = item.get("StopStatus", 1)
         plate = item.get("PlateNumb", "")
         v_type = item.get("VehicleType")
@@ -1965,11 +2264,12 @@ def api_route_status():
         "ubike_suggestion": ubike_suggestion,
         "tts_text": "".join(tts_lines),
         "active_bus_count": active_bus_count,
+        "ubike_updated_hm": ubike_hm,
         "empty": False,
         "service_closed": False,
         "data_fresh": realtime_status["is_fresh"],
         "data_updated_at": realtime_status["updated_at"],
-        "eta_fetched_at": realtime_status["eta_fetched_at"],
+        "eta_fetched_at": time.time(),   # eta_seconds 已經修正成「現在」的數字，所以基準時間就是現在
         "data_age_seconds": realtime_status["age_seconds"],
     })
 
@@ -2108,21 +2408,25 @@ def api_advanced_search():
 # ══════════════════════════════════════════════════════════
 # API：地圖頁面
 # ══════════════════════════════════════════════════════════
-@app.route('/api/map_data')
-def api_map_data():
+def _parse_route_filter():
     r_filter = request.args.get('routes', '')
     filter_list = [r.strip() for r in r_filter.replace("，", ",").split(',') if r.strip()] if r_filter else []
     # 若使用者輸入「全部」（或包含在清單中），視同未篩選，顯示全部路線的公車
     if any(x in ("全部", "全部路線") for x in filter_list):
         filter_list = []
+    return filter_list
 
+
+def _collect_bus_features(filter_list, service_closed):
+    """把定位快照整理成地圖用的公車清單。收班時段（23:00-05:50）不回傳任何公車。"""
+    if service_closed:
+        return [], set()
     if filter_list:
         all_buses = []
         for r in filter_list:
-            all_buses.extend(fetch_bus_realtime_positions(r))
+            all_buses.extend(get_positions_snapshot(r))
     else:
-        # 未篩選：一次性拉取全台南所有路線的即時公車位置
-        all_buses = fetch_bus_realtime_positions()
+        all_buses = get_positions_snapshot()
 
     bus_features = []
     live_route_set = set()
@@ -2133,8 +2437,7 @@ def api_map_data():
         if not lat or not lon or not route:
             continue
         live_route_set.add(route)
-        # 有些車是繞道／支線行駛，實際終點跟路線平常公告的不一樣，這裡一併帶出來，
-        # 前端才能在地圖上特別標示「這班車是開去哪裡」。
+        # 有些車是繞道／支線行駛，實際終點跟路線平常公告的不一樣，這裡一併帶出來
         sub_route = (bus.get("SubRouteName") or {}).get("Zh_tw", "")
         dest_stop = bus.get("DestinationStopNameZh", "") or ""
         branch = dest_stop or (sub_route if sub_route and sub_route != route else "")
@@ -2146,41 +2449,83 @@ def api_map_data():
             "color": get_route_color(route),
             "branch": branch,
         })
+    return bus_features, live_route_set
+
+
+def _positions_age_seconds(fetched_at):
+    """定位快照『現在』有多舊（秒）。前端用這個數字算公車沿路線走到哪一站了，
+    刻意回傳「年齡」而不是時間戳，才不會被使用者手機時鐘不準影響。"""
+    return None if not fetched_at else max(0, int(time.time() - fetched_at))
+
+
+@app.route('/api/map_data')
+def api_map_data():
+    filter_list = _parse_route_filter()
+
+    # 有人開地圖才會走到這裡：定位快照超過 1 小時才向 TDX 抓 1 次，否則直接讀檔
+    pos_status = ensure_positions_fresh_for_map()
+    service_closed = pos_status["service_closed"]
+    bus_features, live_route_set = _collect_bus_features(filter_list, service_closed)
 
     # 無論該路線目前有沒有營運中的公車，都要能顯示其路線軌跡與站牌，
-    # 因此路線清單一律使用「使用者指定的篩選清單」或「系統設定的全部路線＋已存檔路線」，
-    # 而不是只看目前有跑的公車有哪些路線。這樣即使某條路線不在預設分類表裡，
-    # 只要之前用「抓取並儲存路線原始資料」存過，也會出現在地圖與路線清單中。
+    # 因此路線清單一律使用「使用者指定的篩選清單」或「系統設定的全部路線＋已存檔路線」。
     routes_to_draw = filter_list if filter_list else get_all_known_routes()
 
     shape_map, stop_map = fetch_shapes_and_stops_parallel(routes_to_draw)
 
     shape_features = []
     stop_features = []
+    stop_seq_features = []
     for r in routes_to_draw:
         color = get_route_color(r)
         for sh in shape_map.get(r, []):
             pts = parse_wkt_linestring(sh.get("Geometry", ""))
             if pts:
-                shape_features.append({"route": r, "color": color, "points": pts})
+                shape_features.append({"route": r, "color": color, "points": pts,
+                                       "dir": sh.get("Direction", 0)})
         for sp in stop_map.get(r, []):
             stop_features.append({
                 "route": r, "name": sp["name"],
                 "lat": sp["lat"], "lon": sp["lon"], "color": color
             })
+        # 站牌順序（依方向）：前端讓公車沿路線「每 5 分鐘走一站」時要用
+        for seq in fetch_route_stop_sequences(r):
+            stop_seq_features.append({"route": r, "dir": seq["dir"], "stops": seq["stops"]})
 
     realtime_status = get_realtime_status()
     return jsonify({
         "buses": bus_features,
         "shapes": shape_features,
         "stops": stop_features,
+        "stop_seq": stop_seq_features,
         "routes": routes_to_draw,
         "saved_routes": sorted(get_saved_route_names()),
         "live_routes": sorted(live_route_set),
         "now": datetime.now().strftime("%H:%M:%S"),
+        "service_closed": service_closed,
+        "closed_message": SERVICE_CLOSED_MESSAGE if service_closed else "",
+        "positions_age_seconds": _positions_age_seconds(pos_status["fetched_at"]),
         "data_fresh": realtime_status["is_fresh"],
         "data_updated_at": realtime_status["updated_at"],
         "data_age_seconds": realtime_status["age_seconds"],
+    })
+
+
+@app.route('/api/map_buses')
+def api_map_buses():
+    """輕量版：只回傳公車定位（不含軌跡／站牌），給前端『每小時更新一次定位』用。
+    跟 /api/map_data 一樣，只有定位快照超過 1 小時才會真的向 TDX 抓。"""
+    filter_list = _parse_route_filter()
+    pos_status = ensure_positions_fresh_for_map()
+    service_closed = pos_status["service_closed"]
+    bus_features, live_route_set = _collect_bus_features(filter_list, service_closed)
+    return jsonify({
+        "buses": bus_features,
+        "live_routes": sorted(live_route_set),
+        "now": datetime.now().strftime("%H:%M:%S"),
+        "service_closed": service_closed,
+        "closed_message": SERVICE_CLOSED_MESSAGE if service_closed else "",
+        "positions_age_seconds": _positions_age_seconds(pos_status["fetched_at"]),
     })
 
 
@@ -2343,7 +2688,8 @@ def api_save_route_data():
                     suggestions.append(name)
         except Exception:
             pass
-        msg = f"無法從 TDX 取得路線「{route}」的軌跡或站牌資料，請確認路線名稱是否正確"
+        msg = (f"無法從 TDX 取得路線「{route}」的軌跡或站牌資料，請確認路線名稱是否正確"
+               "（也可能是今天的手動查詢額度 10 次已用完，TDX 月額度很緊，明天再試）")
         if suggestions:
             msg += f"。TDX 上名稱相近的路線有：{'、'.join(suggestions[:8])}"
         return jsonify({"error": msg, "suggestions": suggestions[:8]}), 404
@@ -2373,21 +2719,18 @@ def api_save_route_data():
 # ══════════════════════════════════════════════════════════
 @app.route('/api/update_cache', methods=['POST'])
 def api_update_cache():
-    """強制重新抓取『全部路線』的站牌資料並存檔到 /opt/render/project/data/route。
-    一般情況下不需要手動按這顆按鈕——每條路線第一次被查詢或在地圖上顯示時，
-    就會自動存檔；這顆按鈕只是用來一次性強制刷新全部路線的最新資料。"""
-    count = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(_fetch_and_save_stop_data, r): r for r in get_all_known_routes()}
-        for fut in concurrent.futures.as_completed(futures):
-            try:
-                if fut.result():
-                    count += 1
-            except Exception:
-                pass
-    # 清除相關記憶體快取，讓下一次查詢立即反映新資料
-    _cache_store.clear()
-    return jsonify({"status": "success", "count": count})
+    """手動重新抓取全部靜態資料（路線軌跡、站牌、時刻表、站牌清單、路線清單、UBike 站點）。
+    平常不需要按——系統每月 1 號會自動抓好；這顆按鈕共 6 次 TDX 請求，24 小時內只能用一次。"""
+    result = refresh_static_data(force=True)
+    status = result.get("status")
+    if status == "cooldown":
+        return jsonify({"error": "24 小時內已經更新過了（為了節省 TDX 額度），請明天再試"}), 429
+    if status == "busy":
+        return jsonify({"error": "目前正在更新中，請稍後再看結果"}), 409
+    if status not in ("success", "partial"):
+        return jsonify({"error": f"更新失敗：{result.get('reason', '未知原因')}"}), 502
+    return jsonify({"status": "success", "count": result.get("routes_saved", 0),
+                    "partial": status == "partial", "missing": result.get("missing", [])})
 
 
 # ══════════════════════════════════════════════════════════
@@ -2507,6 +2850,11 @@ def api_chat():
         return jsonify({"reply": ai_text, "title": sess["title"]})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# 背景排程放在檔案最後才啟動：確保上面所有函式、變數都已經定義好，不會有啟動瞬間的競態問題。
+realtime_thread = threading.Thread(target=_realtime_poll_loop, daemon=True)
+realtime_thread.start()
 
 
 if __name__ == '__main__':
