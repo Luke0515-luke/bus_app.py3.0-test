@@ -46,6 +46,13 @@ const state = {
   reminderPollTimer: null,
   routeStatusPollTimer: null,
   mapPollTimer: null,
+  busAnimTimer: null,
+  mapNextRefreshAt: 0,
+  mapStopSeq: [],
+  shapeIndex: {},
+  busMarkers: [],
+  busAgeAtLoad: null,
+  busLoadedAtClient: 0,
   busListOpen: true,
   leafletMap: null,
   busLayer: null,
@@ -228,12 +235,11 @@ function showHome() {
   stopRouteStatusAutoRefresh();
 }
 
-// 公車即時定位／到站動態現在改成後台每分鐘統一向 TDX 抓一次、存進檔案，
-// 所有使用者的查詢都直接讀這份檔案（見後端 fetch_bus_data／
-// fetch_bus_realtime_positions），所以前端可以放心地每 15 秒自動重新整理一次
-// 畫面，不會因此增加對 TDX 的查詢量——15 秒只是「更常去讀後台已經準備好的
-// 那份檔案」，不是「更常去問 TDX」。
-const AUTO_REFRESH_SECONDS = 15;
+// 到站動態由後台依時段向 TDX 抓（尖峰 6 分鐘、平常 15 分鐘、週末 20 分鐘一次），
+// 存進檔案；使用者的每次查詢只讀檔，並由後端依「現在 － 抓取時間」修正剩餘時間，
+// 所以前端每 60 秒重新整理一次，就能讓畫面上的預估時間每分鐘跟著往下修正，
+// 完全不會增加對 TDX 的查詢量。
+const AUTO_REFRESH_SECONDS = 60;
 
 function startRouteStatusAutoRefresh() {
   stopRouteStatusAutoRefresh();
@@ -257,27 +263,165 @@ function stopRouteStatusAutoRefresh() {
   const countdownEl = el('route-refresh-countdown');
   if (countdownEl) countdownEl.textContent = '';
 }
+// ── 地圖公車：定位每小時更新一次，中間由程式讓公車沿路線「每 5 分鐘走一站」─────────
+// 為了節省 TDX 查詢額度：後端只有「有人開著地圖、而且定位快照超過 1 小時」才會向 TDX
+// 抓一次最新定位（沒人用就完全不抓）。兩次抓取之間，這裡用快照的「年齡」加上
+// 前端經過的時間，沿著該路線的軌跡把公車一站一站往前推（每 5 分鐘一站，平滑移動），
+// 所以畫面上看到的公車位置是推算的，下一次真實定位進來時會重新校正。
+const MAP_BUS_REFRESH_SECONDS = 3600;   // 定位每小時更新一次
+const BUS_STEP_SECONDS = 300;           // 每 5 分鐘走一站
+const BUS_MAX_SIM_SECONDS = 70 * 60;    // 推算最久只算到 70 分鐘（避免資料很舊時公車飛得太遠）
+const BUS_ANIM_TICK_MS = 5000;          // 畫面上每 5 秒重算一次位置
+
 function startMapAutoRefresh() {
   stopMapAutoRefresh();
-  let secondsLeft = AUTO_REFRESH_SECONDS;
+  state.busAnimTimer = setInterval(updateBusMotion, BUS_ANIM_TICK_MS);
+  // 下一次更新時間：讓後端的定位快照「剛好滿 1 小時」時前端就來問，
+  // 這樣不管開地圖時快照已經多舊，都會在它滿 1 小時的那一刻更新，之後每小時一次。
+  const age = typeof state.busAgeAtLoad === 'number' ? state.busAgeAtLoad : 0;
+  const firstWait = Math.max(60, MAP_BUS_REFRESH_SECONDS - age + 5);
+  state.mapNextRefreshAt = Date.now() + firstWait * 1000;
   const countdownEl = el('map-refresh-countdown');
-  if (countdownEl) countdownEl.textContent = `⏱️ ${secondsLeft}s 後自動更新`;
-  state.mapPollTimer = setInterval(() => {
-    secondsLeft -= 1;
-    if (secondsLeft <= 0) {
-      loadMapData();
-      secondsLeft = AUTO_REFRESH_SECONDS;
+  const tick = () => {
+    const left = Math.round((state.mapNextRefreshAt - Date.now()) / 1000);
+    if (left <= 0) {
+      state.mapNextRefreshAt = Date.now() + MAP_BUS_REFRESH_SECONDS * 1000;
+      loadMapBuses();
+      return;
     }
-    if (countdownEl) countdownEl.textContent = `⏱️ ${secondsLeft}s 後自動更新`;
-  }, 1000);
+    if (countdownEl) countdownEl.textContent = `⏱️ ${Math.ceil(left / 60)} 分鐘後更新定位`;
+  };
+  tick();
+  state.mapPollTimer = setInterval(tick, 30000);
 }
 function stopMapAutoRefresh() {
   if (state.mapPollTimer) {
     clearInterval(state.mapPollTimer);
     state.mapPollTimer = null;
   }
+  if (state.busAnimTimer) {
+    clearInterval(state.busAnimTimer);
+    state.busAnimTimer = null;
+  }
   const countdownEl = el('map-refresh-countdown');
   if (countdownEl) countdownEl.textContent = '';
+}
+
+function busDirNum(d) { return d === '回程' ? 1 : 0; }
+function distMeters(a, b) {
+  const dy = (b[0] - a[0]) * 111320;
+  const dx = (b[1] - a[1]) * 111320 * Math.cos(a[0] * Math.PI / 180);
+  return Math.hypot(dx, dy);
+}
+// 在軌跡 pts 裡，從第 from 個點開始往後找離 (lat, lon) 最近的點，回傳 { i, dm（公尺）}
+function nearestVertex(pts, lat, lon, from) {
+  const cosLat = Math.cos(lat * Math.PI / 180);
+  let bi = -1, bd = Infinity;
+  for (let i = from || 0; i < pts.length; i++) {
+    const dy = lat - pts[i][0], dx = (lon - pts[i][1]) * cosLat;
+    const d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; bi = i; }
+  }
+  if (bi < 0) return null;
+  return { i: bi, dm: distMeters(pts[bi], [lat, lon]) };
+}
+function buildShapeIndex() {
+  const idx = {};
+  state.mapShapeData.forEach(sh => {
+    if (!sh.points || sh.points.length < 2) return;
+    if (!sh._cum) {
+      const cum = [0];
+      for (let i = 1; i < sh.points.length; i++) cum.push(cum[i - 1] + distMeters(sh.points[i - 1], sh.points[i]));
+      sh._cum = cum;
+    }
+    (idx[sh.route] = idx[sh.route] || []).push(sh);
+  });
+  state.shapeIndex = idx;
+}
+// 這條軌跡上，依站序排列的「各站所在的軌跡點編號」（只往前找，確保站序單調遞增）
+function stopVertexIndexes(sh, route, dir) {
+  const key = '_stopIdx' + dir;
+  if (sh[key]) return sh[key];
+  const seqs = (state.mapStopSeq || []).filter(s => s.route === route);
+  const sameDir = seqs.filter(s => s.dir === dir);
+  const pool = sameDir.length ? sameDir : seqs;
+  const seq = pool.sort((a, b) => b.stops.length - a.stops.length)[0];
+  const out = [];
+  if (seq) {
+    let prev = 0;
+    seq.stops.forEach(st => {
+      const hit = nearestVertex(sh.points, st[0], st[1], prev);
+      if (hit && hit.dm <= 300) { out.push(hit.i); prev = hit.i; }
+    });
+  }
+  sh[key] = out;
+  return out;
+}
+// 幫一台公車算出「沿著軌跡要依序經過的軌跡點（起點＝目前定位，之後是每一個下游站牌）」
+function initBusMotion(b) {
+  b._motion = null;
+  const cands = (state.shapeIndex || {})[b.route] || [];
+  const d = busDirNum(b.dir);
+  let pool = cands.filter(s => s.dir === d);
+  if (!pool.length) pool = cands;
+  let best = null;
+  pool.forEach(sh => {
+    const hit = nearestVertex(sh.points, b.lat, b.lon, 0);
+    if (hit && (!best || hit.dm < best.dm)) best = { sh, i: hit.i, dm: hit.dm };
+  });
+  if (!best || best.dm > 400) return;   // 離軌跡太遠（繞道等），不推算
+  const stopIdx = stopVertexIndexes(best.sh, b.route, d);
+  const targets = [...new Set(stopIdx.filter(i => i > best.i))].sort((x, y) => x - y);
+  if (!targets.length) return;          // 已經在終點附近，沒有下一站可走
+  b._motion = { sh: best.sh, waypoints: [best.i, ...targets] };
+}
+// 公車走了 elapsedSec 秒之後的位置：每 BUS_STEP_SECONDS 秒走完「一站到下一站」的軌跡
+function busPositionAt(m, elapsedSec) {
+  const pts = m.sh.points, cum = m.sh._cum, wp = m.waypoints;
+  const steps = wp.length - 1;
+  const s = Math.min(Math.max(elapsedSec, 0), BUS_MAX_SIM_SECONDS) / BUS_STEP_SECONDS;
+  if (s >= steps) return pts[wp[steps]];
+  const k = Math.floor(s), f = s - k;
+  const target = cum[wp[k]] + f * (cum[wp[k + 1]] - cum[wp[k]]);
+  let i = wp[k];
+  while (i < wp[k + 1] - 1 && cum[i + 1] < target) i++;
+  const segLen = cum[i + 1] - cum[i] || 1;
+  const t = Math.min(1, Math.max(0, (target - cum[i]) / segLen));
+  return [pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t, pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t];
+}
+function busElapsedSeconds() {
+  if (typeof state.busAgeAtLoad !== 'number') return 0;
+  return state.busAgeAtLoad + (Date.now() - state.busLoadedAtClient) / 1000;
+}
+function updateBusMotion() {
+  if (!state.busMarkers || !state.busMarkers.length) return;
+  const e = busElapsedSeconds();
+  state.busMarkers.forEach(({ marker, bus }) => {
+    if (!bus._motion) return;
+    const p = busPositionAt(bus._motion, e);
+    marker.setLatLng(p);
+  });
+}
+function applyBusPayload(data) {
+  state.mapBusData = data.buses || [];
+  state.busAgeAtLoad = (typeof data.positions_age_seconds === 'number') ? data.positions_age_seconds : null;
+  state.busLoadedAtClient = Date.now();
+}
+// 只更新公車定位（不重抓軌跡／站牌），每小時由計時器呼叫一次
+async function loadMapBuses() {
+  const inputVal = el('map-route-input').value.trim();
+  if (!inputVal && !state.mapShowAll) return;
+  const params = inputVal ? `?routes=${encodeURIComponent(inputVal)}` : '';
+  try {
+    const data = await api(`/api/map_buses${params}`);
+    applyBusPayload(data);
+    el('map-caption').textContent = data.service_closed
+      ? (data.closed_message || '🌙 末班車已收車')
+      : `資料時間：${data.now}　｜　公車定位每小時更新一次，中間每 5 分鐘沿路線推算前進一站`;
+    drawMapBuses();
+    renderMapPanel(el('map-search-box').value);
+    if (!state.mapBusData.length) stopMapAutoRefresh();
+  } catch (e) { /* 這次失敗就等下個小時 */ }
 }
 
 function showSubpage(id, anchorId) {
@@ -565,7 +709,7 @@ async function loadRouteStatus() {
 
   state.destNames = { 去程: data.dest0, 回程: data.dest1 };
   const busCountText = typeof data.active_bus_count === 'number'
-    ? `（GPS 定位目前共 ${data.active_bus_count} 台營運中）` : '';
+    ? `（目前共 ${data.active_bus_count} 台營運中）` : '';
   el('status-title').textContent = `🚌 ${state.routeChoice} 全線即時動態${busCountText}`;
   el('btn-dir0').textContent = `➡️ 往 ${data.dest0}`;
   el('btn-dir1').textContent = `⬅️ 往 ${data.dest1}`;
@@ -584,7 +728,8 @@ async function loadRouteStatus() {
   // 不用使用者自己在時間軸裡一站一站找哪裡有標示支線。
   renderBranchPanel(data.branches || []);
 
-  const fetchedAt = data.eta_fetched_at; // epoch 秒：後端這批到站資料是什麼時候抓到的
+  // 後端回傳的 eta_seconds 已經修正成「回應當下」的剩餘秒數，所以倒數基準用收到回應的瞬間（用自己的時鐘，不怕手機時間不準）
+  const fetchedAt = Date.now() / 1000;
   const container = el('timeline-container');
   container.innerHTML = data.stops.map(s => {
     let busHtml = '';
@@ -598,7 +743,7 @@ async function loadRouteStatus() {
     // 繞道／支線公車：這一班實際開往的目的地跟路線平常公告的方向不一樣時特別標示出來
     const branchHtml = s.branch ? `<span class="branch-tag">🔀 往 ${esc(s.branch)}</span>` : '';
     const ubikeHtml = (s.ubikes || []).map(u =>
-      `<span class="ubike-tag">🚲 可借:${u.available} 可還:${u.empty}</span>`).join('');
+      `<span class="ubike-tag" title="UBike 資料時間：${esc(data.ubike_updated_hm || '未知')}（只在平日尖峰更新）">🚲 可借:${u.available} 可還:${u.empty}${data.ubike_updated_hm ? `（${esc(data.ubike_updated_hm.slice(-5))}）` : ''}</span>`).join('');
     // 只有「有實際數字秒數」的 badge 才需要前端即時倒數（真的到站預估／推算／時刻表估計），
     // 「尚未發車」「交管不停靠」這類純文字狀態沒有數字可以倒數，維持原樣就好。
     const suffix = s.is_schedule_estimate ? '（時刻表估計）' : '';
@@ -1346,22 +1491,25 @@ async function loadMapData(forceRefresh) {
   const params = inputVal ? `?routes=${encodeURIComponent(inputVal)}` : '';
   try {
     const data = await api(`/api/map_data${params}`);
-    state.mapBusData = data.buses;
+    applyBusPayload(data);
     state.mapShapeData = data.shapes;
     state.mapStopData = data.stops || [];
+    state.mapStopSeq = data.stop_seq || [];
+    buildShapeIndex();
     state.savedRoutes = data.saved_routes || [];
     state.mapActiveRoutes = new Set(data.routes); // 這次實際抓到、畫出來的路線
     const staleNote = data.data_fresh === false ? '　｜　⚠️ 尚未更新資料' : '';
-    el('map-caption').textContent = `資料時間：${data.now}　｜　每次按「🔄 更新」重抓最新位置${staleNote}`;
+    el('map-caption').textContent = data.service_closed
+      ? (data.closed_message || '🌙 末班車已收車')
+      : `資料時間：${data.now}　｜　公車定位每小時更新一次，中間每 5 分鐘沿路線推算前進一站${staleNote}`;
     drawMapShapes();
     drawMapStops();
     drawMapBuses();
     renderMapPanel(el('map-search-box').value);
-    // 只有「畫面上真的有顯示公車定位」才開始跑 15 秒倒數自動更新；
-    // 還沒選路線、或選到的路線目前剛好沒有任何公車在跑，就不要一直倒數
-    // 卻永遠等不到東西可以更新，那樣只會讓人覺得畫面一直在空轉。
+    // 只有「畫面上真的有顯示公車定位」才啟動：每小時更新定位 ＋ 沿路線推算移動；
+    // 沒選路線、收班、或選到的路線目前沒有公車在跑，就不啟動（完全不會再打後端）。
     if (state.mapBusData && state.mapBusData.length > 0) {
-      if (!state.mapPollTimer) startMapAutoRefresh();
+      startMapAutoRefresh();
     } else {
       stopMapAutoRefresh();
     }
@@ -1441,16 +1589,22 @@ function countByRoute() {
 }
 function drawMapBuses() {
   state.busLayer.clearLayers();
+  state.busMarkers = [];
   let total = 0;
+  const elapsed = busElapsedSeconds();
   state.mapBusData.forEach(b => {
     if (!state.mapActiveRoutes.has(b.route)) return;
-    const marker = L.marker([b.lat, b.lon], { icon: makeBusIcon(b.color) });
+    initBusMotion(b);
+    const startPos = b._motion ? busPositionAt(b._motion, elapsed) : [b.lat, b.lon];
+    const marker = L.marker(startPos, { icon: makeBusIcon(b.color) });
+    state.busMarkers.push({ marker, bus: b });
     marker.bindPopup(`
       <div class="bus-popup">
         <b>🚌 ${esc(b.route)}</b><br>
         <span class="tag" style="background:${b.color}">車牌：${esc(b.plate)}</span>
         <span class="tag" style="background:#555">方向：${esc(b.dir)}</span>
         <span class="tag" style="background:#333">速度：${esc(String(b.speed))} km/h</span>
+        ${b._motion ? '<span class="tag" style="background:#7f8c8d">📍 沿路線推算位置</span>' : ''}
         ${b.branch ? `<span class="tag" style="background:#f39c12">🔀 往 ${esc(b.branch)}</span>` : ''}
       </div>`, { maxWidth: 220 });
     marker.addTo(state.busLayer);
