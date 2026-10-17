@@ -2717,6 +2717,62 @@ def api_save_route_data():
 # ══════════════════════════════════════════════════════════
 # API：系統維護（重建站點快取）
 # ══════════════════════════════════════════════════════════
+@app.route('/api/debug_status')
+def api_debug_status():
+    """診斷用（唯讀）：看目前排程、快照、TDX 用量狀態。
+    加上 ?test=1 會『真的』向 TDX 發 1 次到站預估請求，並原樣回報 HTTP 狀態碼與回應片段，
+    用來判斷到底是 TDX 沒回資料、金鑰有問題、還是別的原因（會扣 1 次手動額度）。
+    如果有設定 ADMIN_TOKEN 環境變數，test=1 需要帶 &token=你的ADMIN_TOKEN。"""
+    now = _taipei_now()
+    _ensure_realtime_cache_fresh()
+    with _realtime_lock:
+        eta_routes = len(_realtime_cache.get("eta_by_route") or {})
+        eta_items = sum(len(v) for v in (_realtime_cache.get("eta_by_route") or {}).values())
+        cache_meta = {k: _realtime_cache.get(k) for k in (
+            "updated_at", "eta_fetched_at", "positions_fetched_at",
+            "last_attempt", "last_attempt_ts", "last_attempt_ok")}
+    usage = tdx_usage_snapshot()
+    interval = get_smart_poll_interval(now)
+    info = {
+        "version": "tdx-budget-v1",
+        "taipei_now": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "service_hours": is_service_hours(now),
+        "poll_interval_minutes": None if interval is None else interval // 60,
+        "tdx_credentials_set": bool(app_id and app_key),
+        "tdx_token_ok": bool(get_tdx_token()),
+        "usage": {"count": usage.get("count"), "cap": TDX_MONTHLY_CAP, "by_kind": usage.get("by_kind")},
+        "eta_snapshot": {"routes": eta_routes, "items": eta_items,
+                         "age_seconds": None if not cache_meta["eta_fetched_at"]
+                         else int(time.time() - cache_meta["eta_fetched_at"]),
+                         **cache_meta},
+        "poll_thread_alive": bool(globals().get("realtime_thread") and realtime_thread.is_alive()),
+        "static_meta": _read_json_cached(STATIC_META_FILE, {}),
+        "saved_route_count": len(get_saved_route_names()),
+    }
+    if request.args.get("test") == "1":
+        admin_token = os.environ.get("ADMIN_TOKEN", "")
+        if admin_token and request.args.get("token", "") != admin_token:
+            info["test"] = {"error": "需要帶 &token=ADMIN_TOKEN"}
+            return jsonify(info)
+        if not tdx_budget_consume("manual"):
+            info["test"] = {"error": "額度或今日手動測試次數已用完"}
+            return jsonify(info)
+        try:
+            res = requests.get(
+                "https://tdx.transportdata.tw/api/basic/v2/Bus/EstimatedTimeOfArrival/City/Tainan?%24format=JSON&%24top=3",
+                headers=tdx_headers(), timeout=20)
+            body = res.text[:400]
+            try:
+                parsed = res.json()
+                count = len(parsed) if isinstance(parsed, list) else None
+            except Exception:
+                count = None
+            info["test"] = {"http_status": res.status_code, "items_returned": count, "body_preview": body}
+        except Exception as e:
+            info["test"] = {"error": str(e)}
+    return jsonify(info)
+
+
 @app.route('/api/update_cache', methods=['POST'])
 def api_update_cache():
     """手動重新抓取全部靜態資料（路線軌跡、站牌、時刻表、站牌清單、路線清單、UBike 站點）。
