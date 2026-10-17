@@ -271,7 +271,7 @@ function stopRouteStatusAutoRefresh() {
 const MAP_BUS_REFRESH_SECONDS = 3600;   // 定位每小時更新一次
 const BUS_STEP_SECONDS = 300;           // 每 5 分鐘走一站
 const BUS_MAX_SIM_SECONDS = 70 * 60;    // 推算最久只算到 70 分鐘（避免資料很舊時公車飛得太遠）
-const BUS_ANIM_TICK_MS = 5000;          // 畫面上每 5 秒重算一次位置
+const BUS_ANIM_TICK_MS = 1000;          // 畫面上每 1 秒重算一次位置，公車會持續慢慢往前爬
 
 function startMapAutoRefresh() {
   stopMapAutoRefresh();
@@ -369,10 +369,19 @@ function initBusMotion(b) {
     const hit = nearestVertex(sh.points, b.lat, b.lon, 0);
     if (hit && (!best || hit.dm < best.dm)) best = { sh, i: hit.i, dm: hit.dm };
   });
-  if (!best || best.dm > 400) return;   // 離軌跡太遠（繞道等），不推算
+  if (!best || best.dm > 800) return;   // 離軌跡太遠（繞道等），不推算
   const stopIdx = stopVertexIndexes(best.sh, b.route, d);
   const targets = [...new Set(stopIdx.filter(i => i > best.i))].sort((x, y) => x - y);
-  if (!targets.length) return;          // 已經在終點附近，沒有下一站可走
+  if (!targets.length) {
+    // 沒有站牌順序資料時的備援：沿軌跡每約 400 公尺當作「一站」往前走，公車還是會動
+    const cum = best.sh._cum, wps = [best.i];
+    let nextDist = cum[best.i] + 400;
+    for (let i = best.i + 1; i < best.sh.points.length; i++) {
+      if (cum[i] >= nextDist) { wps.push(i); nextDist = cum[i] + 400; }
+    }
+    if (wps.length > 1) b._motion = { sh: best.sh, waypoints: wps };
+    return;                             // 其餘情況＝已在終點附近，不推算
+  }
   b._motion = { sh: best.sh, waypoints: [best.i, ...targets] };
 }
 // 公車走了 elapsedSec 秒之後的位置：每 BUS_STEP_SECONDS 秒走完「一站到下一站」的軌跡
