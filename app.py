@@ -25,6 +25,7 @@ import threading
 import shutil
 import fcntl
 import calendar
+import gc
 
 load_dotenv()
 
@@ -2745,6 +2746,8 @@ def api_debug_status():
                          "age_seconds": None if not cache_meta["eta_fetched_at"]
                          else int(time.time() - cache_meta["eta_fetched_at"]),
                          **cache_meta},
+        "memory_mb": None if _process_rss_mb() is None else round(_process_rss_mb(), 1),
+        "memory_limit_mb": MEMORY_LIMIT_MB,
         "poll_thread_alive": bool(globals().get("realtime_thread") and realtime_thread.is_alive()),
         "static_meta": _read_json_cached(STATIC_META_FILE, {}),
         "saved_route_count": len(get_saved_route_names()),
@@ -2908,9 +2911,63 @@ def api_chat():
         return jsonify({"error": str(e)}), 500
 
 
+# ══════════════════════════════════════════════════════════
+# 記憶體看守：Render 記憶體快滿時，自動清掉可以重建的暫存
+# ══════════════════════════════════════════════════════════
+# 每 30 秒量一次這個處理程序實際佔用的記憶體，超過上限的 80% 就清掉「可以重新讀檔重建」的暫存
+# （路線軌跡／站牌的記憶體快取、JSON 檔案快取、站名索引、UBike 快照），再強制回收記憶體。
+# 只清暫存，不會刪除任何存檔、快照檔、帳號或使用者的最愛／對話資料。
+# Render 免費方案記憶體約 512MB；要換成別的大小，在 Render 的 Environment 設定 MEMORY_LIMIT_MB。
+MEMORY_LIMIT_MB = float(os.environ.get("MEMORY_LIMIT_MB", "512"))
+MEMORY_CLEAN_RATIO = 0.80
+MEMORY_CHECK_SECONDS = 30
+
+
+def _process_rss_mb():
+    """目前這個處理程序實際使用的記憶體（MB）。讀不到回傳 None。"""
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return None
+
+
+def _free_memory_caches():
+    """清掉可重建的暫存（保留 TDX token 快取，避免白白重新登入）。"""
+    for key in list(_cache_store.keys()):
+        if key != _TOKEN_CACHE_KEY:
+            _cache_store.pop(key, None)
+    _json_file_cache.clear()
+    _stop_route_index_cache["data"] = None
+    _stop_route_index_cache["time"] = 0
+    _ubike_memo["key"] = None
+    _ubike_memo["stations"] = []
+    _ubike_memo["avail"] = {}
+    gc.collect()
+
+
+def _memory_guard_loop():
+    while True:
+        try:
+            rss = _process_rss_mb()
+            if rss is not None and rss > MEMORY_LIMIT_MB * MEMORY_CLEAN_RATIO:
+                _free_memory_caches()
+                after = _process_rss_mb()
+                print(f"🧹 記憶體 {rss:.0f}MB 超過上限 {MEMORY_LIMIT_MB * MEMORY_CLEAN_RATIO:.0f}MB，"
+                      f"已自動清除暫存，清除後約 {after:.0f}MB" if after is not None else
+                      f"🧹 記憶體 {rss:.0f}MB 偏高，已自動清除暫存", flush=True)
+        except Exception as e:
+            print(f"⚠️ 記憶體看守發生例外：{e}", flush=True)
+        time.sleep(MEMORY_CHECK_SECONDS)
+
+
 # 背景排程放在檔案最後才啟動：確保上面所有函式、變數都已經定義好，不會有啟動瞬間的競態問題。
 realtime_thread = threading.Thread(target=_realtime_poll_loop, daemon=True)
 realtime_thread.start()
+threading.Thread(target=_memory_guard_loop, daemon=True).start()
 
 
 if __name__ == '__main__':
