@@ -111,6 +111,7 @@ document.addEventListener('DOMContentLoaded', () => {
   renderHomeDate();
   loadHomeWeather();
   setInterval(loadHomeWeather, 10 * 60 * 1000); // 天氣後端本身快取 10 分鐘，前端跟著每 10 分鐘刷新一次就好
+  applyUrlParams();   // 分享連結 ?route=33&stop=某站&dir=0
 });
 
 function bindStaticEvents() {
@@ -494,6 +495,150 @@ async function loadTimetable(route) {
   }
 }
 
+// ── 路線附加區：分享連結／QR code／歷史班距 ───────────────────────────
+// 全部都是前端組裝或讀本地統計檔，不會多打任何 TDX。
+function ensureRouteExtras() {
+  let box = el('route-extras');
+  if (box) return box;
+  box = document.createElement('div');
+  box.id = 'route-extras';
+  box.className = 'hidden';
+  box.innerHTML = `
+    <div id="headway-box" class="hw-box hidden"></div>
+    <button id="btn-share-route" class="btn btn-block">🔗 分享這個站牌／路線（連結＋QR code）</button>
+    <div id="share-box" class="share-box hidden"></div>`;
+  el('timetable-box').insertAdjacentElement('afterend', box);
+  el('btn-share-route').addEventListener('click', () => openShare(el('start-select') ? el('start-select').value : ''));
+  return box;
+}
+
+function buildShareUrl(stop) {
+  const p = new URLSearchParams();
+  p.set('route', state.routeChoice || '');
+  if (stop) p.set('stop', stop);
+  p.set('dir', state.dirToggle === '回程' ? '1' : '0');
+  return `${location.origin}${location.pathname}?${p.toString()}`;
+}
+
+let qrLibPromise = null;
+function loadQrLib() {
+  if (window.QRCode) return Promise.resolve(true);
+  if (qrLibPromise) return qrLibPromise;
+  qrLibPromise = new Promise(resolve => {
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';
+    s.onload = () => resolve(!!window.QRCode);
+    s.onerror = () => { qrLibPromise = null; resolve(false); };
+    document.head.appendChild(s);
+  });
+  return qrLibPromise;
+}
+
+async function openShare(stop) {
+  if (!state.routeChoice) return;
+  ensureRouteExtras().classList.remove('hidden');
+  const url = buildShareUrl(stop);
+  const title = `${state.routeChoice}${stop ? '・' + stop : ''}`;
+  const box = el('share-box');
+  box.classList.remove('hidden');
+  box.innerHTML = `
+    <div class="share-title">🔗 ${esc(title)}（${esc(state.dirToggle)}）</div>
+    <div class="share-qr" id="share-qr"><span class="caption">QR code 產生中...</span></div>
+    <input class="share-url" id="share-url" type="text" readonly value="${esc(url)}">
+    <div class="share-actions">
+      <button class="btn" id="btn-share-copy">📋 複製連結</button>
+      ${navigator.share ? '<button class="btn" id="btn-share-native">📤 分享</button>' : ''}
+      <button class="btn" id="btn-share-close">✕ 關閉</button>
+    </div>
+    <div class="caption">用手機掃描 QR code 或點連結，會直接打開這條路線${stop ? '並停在這一站' : ''}。</div>`;
+  el('share-url').addEventListener('focus', e => e.target.select());
+  el('btn-share-close').addEventListener('click', () => box.classList.add('hidden'));
+  el('btn-share-copy').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText(url); }
+    catch (e) { el('share-url').select(); document.execCommand('copy'); }
+    el('btn-share-copy').textContent = '✅ 已複製';
+    setTimeout(() => { const b = el('btn-share-copy'); if (b) b.textContent = '📋 複製連結'; }, 1500);
+  });
+  const nb = el('btn-share-native');
+  if (nb) nb.addEventListener('click', () => navigator.share({ title: `台南公車 ${title}`, url }).catch(() => {}));
+  box.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  const ok = await loadQrLib();
+  const qrBox = el('share-qr');
+  if (!qrBox) return;
+  if (!ok) { qrBox.innerHTML = '<span class="caption">QR code 載入失敗（網路問題），請直接複製連結。</span>'; return; }
+  qrBox.innerHTML = '';
+  new QRCode(qrBox, { text: url, width: 176, height: 176, correctLevel: QRCode.CorrectLevel.M });
+}
+
+// 開啟 ?route=33&stop=某站&dir=0 這種連結：自動選路線、方向、等候站，並捲到那一站
+async function applyUrlParams() {
+  const p = new URLSearchParams(location.search);
+  const route = (p.get('route') || '').trim();
+  if (!route) return;
+  const stop = (p.get('stop') || '').trim();
+  const dir = p.get('dir');
+  state.dirToggle = (dir === '1' || dir === '回程') ? '回程' : '去程';
+  const grid = el('mobile-home-grid');
+  if (grid && grid.offsetParent !== null) { try { handleHomeTile('filter'); } catch (e) { /* noop */ } }
+  await selectRouteByName(route);
+  el('btn-dir0').classList.toggle('active', state.dirToggle === '去程');
+  el('btn-dir1').classList.toggle('active', state.dirToggle === '回程');
+  if (stop) {
+    const ss = el('start-select');
+    if (ss && [...ss.options].some(o => o.value === stop)) {
+      ss.value = stop;
+      await loadRouteStatus();
+      const target = document.querySelector('#timeline-container .waiting-stop');
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+  }
+}
+
+// 每個站牌旁的小 🔗：只分享那一站
+document.addEventListener('click', e => {
+  const b = e.target.closest && e.target.closest('.stop-share');
+  if (b) { e.preventDefault(); openShare(b.dataset.stop || ''); }
+});
+
+// ── 歷史班距（後端依實際抓到的到站資料累積）──────────────────────────
+async function loadHeadway(route) {
+  const box = el('headway-box');
+  if (!box) return;
+  box.classList.add('hidden');
+  box.innerHTML = '';
+  try {
+    const d = await api(`/api/headway?route=${encodeURIComponent(route)}`);
+    if (state.routeChoice !== route) return;     // 使用者已經換路線了
+    const dayName = d.daytype_now === 'wd' ? '上班日' : '假日';
+    if (!d.directions.length) {
+      box.innerHTML = `<div class="hw-title">📊 歷史班距</div><div class="caption">還沒有累積到統計資料（系統每次更新到站資料時會自動累積，約一兩天後會有數字）。</div>`;
+      box.classList.remove('hidden');
+      return;
+    }
+    const dirName = n => (n === 0 ? '➡️ 去程' : '⬅️ 回程');
+    box.innerHTML = `<div class="hw-title">📊 歷史班距（${dayName}・${d.hour_now} 點）</div>` + d.directions.map(x => {
+      const nowTxt = x.now
+        ? `約 <b>${Math.round(x.now.median)}</b> 分鐘一班 <span class="caption">（樣本 ${x.now.n}）</span>`
+        : '<span class="caption">這個時段樣本還不夠</span>';
+      const rows = (x.table[d.daytype_now] || []).map(r =>
+        `<span class="hw-chip ${r.hour === d.hour_now ? 'now' : ''}" title="樣本 ${r.n}">${r.hour} 點 <b>${Math.round(r.median)}</b>′</span>`).join('');
+      return `<div class="hw-dir"><div class="hw-line">${dirName(x.direction)}：${nowTxt}</div>` +
+        (rows ? `<details class="hw-more"><summary>各時段班距（${dayName}）</summary><div class="hw-chips">${rows}</div>` +
+          `<div class="caption">以「${esc(x.ref_stop)}」為參考站，取每個時段最近的實際班距中位數。</div></details>` : '') + `</div>`;
+    }).join('');
+    box.classList.remove('hidden');
+  } catch (e) { /* 班距只是附加資訊，失敗就不顯示 */ }
+}
+
+function updateRouteExtras(route) {
+  const box = ensureRouteExtras();
+  el('share-box').classList.add('hidden');
+  if (!route) { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  loadHeadway(route);
+}
+
+
 // ── 字體 / 頁面切換 ─────────────────────────────────────────
 function toggleFont() {
   state.fontLarge = !state.fontLarge;
@@ -560,6 +705,7 @@ async function onRouteSelect() {
   el('status-empty').classList.remove('hidden');
   el('timetable-box').classList.add('hidden');
   el('timetable-box').innerHTML = '';
+  updateRouteExtras(route);
 
   if (!route) {
     el('btn-fav-toggle').classList.add('hidden');
@@ -708,6 +854,7 @@ async function loadRouteStatus() {
   const ageBase = (typeof data.data_age_seconds === 'number') ? data.data_age_seconds : null;
   const ageAt = Date.now() / 1000;
   const container = el('timeline-container');
+  state.etaAge = (ageBase !== null) ? { base: ageBase, at: ageAt } : null;
   container.innerHTML = data.stops.map(s => {
     let busHtml = '';
     if (s.has_bus) {
@@ -734,18 +881,29 @@ async function loadRouteStatus() {
     <div class="station-info">
       <div class="station-info-top">
         <span class="station-name">${esc(s.name)}</span>
+        <button class="stop-share" data-stop="${esc(s.name)}" title="分享這一站" aria-label="分享這一站">🔗</button>
         ${busHtml}${branchHtml}
       </div>
       ${ubikeHtml ? `<div class="station-info-ubike">${ubikeHtml}</div>` : ''}
-      ${(ageBase !== null && tickAttrs && !s.is_schedule_estimate)
-        ? `<div class="eta-age" style="font-size:12px;color:#888;" data-age-base="${ageBase}" data-age-at="${ageAt}"></div>` : ''}
     </div>
-    <span class="time-badge ${s.badge_class}"${tickAttrs}>${esc(s.eta_text)}</span>
+    <div class="eta-col">
+      <span class="time-badge ${s.badge_class}"${tickAttrs}>${esc(s.eta_text)}</span>
+      ${(ageBase !== null && tickAttrs && !s.is_schedule_estimate)
+        ? `<span class="eta-age" data-age-base="${ageBase}" data-age-at="${ageAt}"></span>` : ''}
+    </div>
   </div>
 </div>`;
   }).join('');
 
   state.ttsText = data.tts_text || '';
+  let sum = el('eta-age-summary');
+  if (!sum) {
+    sum = document.createElement('div');
+    sum.id = 'eta-age-summary';
+    sum.className = 'eta-age-summary';
+    container.insertAdjacentElement('beforebegin', sum);
+  }
+  sum.classList.toggle('hidden', !state.etaAge);
   el('status-box').classList.remove('hidden');
   startEtaTicker();
 }
@@ -791,8 +949,16 @@ function tickEtaCountdowns() {
     if (isNaN(base) || isNaN(at)) return;
     const age = base + (nowSec - at);
     tag.textContent = formatDataAge(age);
-    tag.style.color = age >= 600 ? '#d35400' : '#888';   // 超過 10 分鐘用橘色提醒
+    tag.classList.toggle('age-warn', age >= 300 && age < 600);   // 5～10 分鐘：琥珀色
+    tag.classList.toggle('age-old', age >= 600);                  // 超過 10 分鐘：橘紅色
   });
+  const sum = el('eta-age-summary');
+  if (sum && state.etaAge) {
+    const age = state.etaAge.base + (nowSec - state.etaAge.at);
+    sum.innerHTML = `📡 到站資料 <b>${age < 60 ? '剛更新' : Math.floor(age / 60) + ' 分鐘前'}</b>抓取` +
+      `<span class="caption">（尖峰約每 6 分、平常約每 15 分更新；倒數是依時間推算，下次更新會校正）</span>`;
+    sum.classList.toggle('stale', age >= 600);
+  }
   document.querySelectorAll('#timeline-container .time-badge[data-eta-seconds]').forEach(badge => {
     const baseSeconds = parseFloat(badge.dataset.etaSeconds);
     const fetchedAt = parseFloat(badge.dataset.fetchedAt);
@@ -881,11 +1047,11 @@ function renderRecent() {
   const list = el('recent-list');
   if (!state.recent.length) { sec.classList.add('hidden'); return; }
   sec.classList.remove('hidden');
-  list.innerHTML = state.recent.map(r => `<button class="btn" data-r="${esc(r)}">🔁 ${esc(r)}</button>`).join('');
-  list.querySelectorAll('button').forEach(b => b.addEventListener('click', () => selectRouteByName(b.dataset.r)));
+  list.innerHTML = state.recent.map(r => `<button class="btn" data-r="${esc(r)}" title="查詢 ${esc(r)} 的即時動態與時刻表">🔁 ${esc(r)}</button>`).join('');
+  list.querySelectorAll('button').forEach(b => b.addEventListener('click', () => selectRouteByName(b.dataset.r, { timetable: true })));
 }
 
-async function selectRouteByName(route) {
+async function selectRouteByName(route, opts) {
   document.body.classList.remove('sidebar-open');
   state.selectedFilters.clear();
   document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
@@ -896,6 +1062,10 @@ async function selectRouteByName(route) {
   }
   sel.value = route;
   await onRouteSelect();
+  if (opts && opts.timetable) {   // 從「最近查詢」點進來：順便把這條路線的固定時刻表攤開
+    await loadTimetable(route);
+    el('timetable-box').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
 }
 
 // ── 進階查詢（站到站） ────────────────────────────────────
@@ -929,7 +1099,7 @@ function fmtMin(m) {
 }
 function planSrcTag(src) {
   if (!src) return '';
-  return `<span class="plan-src ${src === '即時' ? 'live' : 'sched'}">${esc(src)}</span>`;
+  return `<span class="plan-src ${src === '即時' ? 'live' : (src === '班距' ? 'hist' : 'sched')}">${esc(src)}</span>`;
 }
 // 一個時間軸步驟：左邊圖示＋軌道線、中間說明、右邊時間
 function planStep(icon, title, sub, time, cls) {
@@ -1014,7 +1184,7 @@ function renderAdvResults() {
       const btnText = times ? '🔄 重新計算時間' : '⏱ 運算轉乘時間';
       html += `<div class="plan-toolbar"><button id="btn-adv-times" class="btn btn-block">${btnText}</button>` +
         `<div id="adv-times-msg" class="caption">${times
-          ? `現在 ${esc(meta.now)}・搭乘時間以每站約 ${meta.perStop} 分估算；等車依「即時」到站或「時刻表」`
+          ? `現在 ${esc(meta.now)}・搭乘時間以每站約 ${meta.perStop} 分估算；等車依「即時」到站、「時刻表」或歷史「班距」（平均等班距的一半）`
           : '按下按鈕，估算每個方案的等車、搭乘、步行與抵達時間'}</div></div>`;
     }
     const sortPlans = (arr, idOf) => {
