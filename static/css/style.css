@@ -570,3 +570,72 @@ body.theme-night #yellow-bus-picker select { background: #171a24; color: #eee; b
 }
 .reminder-delete-btn { padding: 4px 10px; flex-shrink: 0; }
 body.theme-night .reminder-item { border-color: #262a38; }
+
+/* ── 站到站查詢：轉乘／直達卡片＋時間軸（手機、電腦共用）──────────────
+   卡片自己帶深色底，放在側欄、手機彈出選單或較寬的子頁面都清楚。 */
+#adv-search-result .plan-toolbar { margin: 8px 0; }
+#adv-search-result .plan-toolbar .caption { margin-top: 6px; line-height: 1.5; }
+.plan-err { color: #ff8a8a; }
+
+.plan-list { display: grid; gap: 10px; grid-template-columns: 1fr; margin: 8px 0 12px; }
+@container (min-width: 560px) { .plan-list { grid-template-columns: repeat(2, 1fr); } }
+#adv-search-body { container-type: inline-size; }
+
+.plan-card {
+  background: var(--ink-elevated); color: var(--text-main);
+  border: 1px solid var(--ink-line); border-radius: 12px; padding: 10px 12px 6px;
+  min-width: 0;
+}
+.plan-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 8px;
+  padding-bottom: 8px; margin-bottom: 4px; border-bottom: 1px solid var(--ink-line);
+}
+.plan-routes { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; }
+.plan-routes .btn { padding: 4px 9px; font-size: 13px; min-height: 30px; }
+.plan-arrow { color: var(--text-muted); font-size: 12px; }
+.plan-meta { flex-basis: 100%; font-size: 11px; color: var(--text-muted); }
+.plan-total { text-align: right; flex-shrink: 0; display: flex; flex-direction: column; align-items: flex-end; line-height: 1.25; }
+.plan-total-main { font-family: var(--font-display); font-weight: 700; font-size: 17px; color: var(--signal); white-space: nowrap; }
+.plan-total-sub { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
+
+.plan-steps { list-style: none; margin: 0; padding: 0; }
+.plan-step {
+  position: relative; display: grid; grid-template-columns: 26px 1fr auto; gap: 8px;
+  align-items: start; padding: 6px 0 8px;
+}
+/* 左側的垂直軌道線，把每一段串起來 */
+.plan-step::before {
+  content: ''; position: absolute; left: 12px; top: 28px; bottom: -4px; width: 2px;
+  background: repeating-linear-gradient(to bottom, var(--ink-line) 0 4px, transparent 4px 7px);
+}
+.plan-step.last::before { display: none; }
+.plan-dot {
+  width: 26px; height: 26px; border-radius: 999px; font-size: 14px;
+  display: flex; align-items: center; justify-content: center;
+  background: #0e1a16; border: 1px solid rgba(45,212,191,.35);
+}
+.plan-title { font-size: 13px; line-height: 1.4; word-break: break-word; }
+.plan-sub { font-size: 11px; color: var(--text-muted); margin-top: 1px; line-height: 1.4; }
+.plan-time { font-size: 13px; text-align: right; white-space: nowrap; line-height: 1.4; }
+.plan-time b { color: var(--link-blue); font-weight: 700; }
+.plan-na { color: var(--text-muted); font-size: 12px; }
+.plan-src {
+  display: inline-block; margin-left: 4px; padding: 0 5px; border-radius: 4px;
+  font-size: 10px; line-height: 16px; vertical-align: 1px;
+}
+.plan-src.live  { background: rgba(45,212,191,.16); color: #5eead4; }
+.plan-src.sched { background: rgba(245,165,36,.16); color: var(--signal); }
+
+/* 手機：字放大一點、點擊區加大，時間欄固定寬度不擠到文字 */
+@media (max-width: 900px) {
+  .plan-card { padding: 12px 12px 8px; }
+  .plan-title { font-size: 14px; }
+  .plan-time { font-size: 14px; }
+  .plan-total-main { font-size: 18px; }
+  .plan-routes .btn { min-height: 36px; font-size: 14px; }
+}
+@media (max-width: 360px) {
+  .plan-step { grid-template-columns: 24px 1fr; }
+  .plan-time { grid-column: 2; text-align: left; margin-top: -2px; }
+  .plan-step::before { left: 11px; }
+}
