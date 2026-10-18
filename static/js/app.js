@@ -683,7 +683,7 @@ async function loadRouteStatus() {
 
   state.destNames = { 去程: data.dest0, 回程: data.dest1 };
   const busCountText = typeof data.active_bus_count === 'number'
-    ? `（GPS 定位目前共 ${data.active_bus_count} 台營運中）` : '';
+    ? `（目前共 ${data.active_bus_count} 台營運中）` : '';
   el('status-title').textContent = `🚌 ${state.routeChoice} 全線即時動態${busCountText}`;
   el('btn-dir0').textContent = `➡️ 往 ${data.dest0}`;
   el('btn-dir1').textContent = `⬅️ 往 ${data.dest1}`;
@@ -703,6 +703,10 @@ async function loadRouteStatus() {
   renderBranchPanel(data.branches || []);
 
   const fetchedAt = data.eta_fetched_at; // epoch 秒：後端這批到站資料是什麼時候抓到的
+  // 資料年齡（項目 5）：後端到站快照現在有多舊（秒）。用「收到回應當下的年齡」加上
+  // 之後經過的時間，每秒自己往上加，使用者就能看出每筆預估其實是幾分鐘前抓的。
+  const ageBase = (typeof data.data_age_seconds === 'number') ? data.data_age_seconds : null;
+  const ageAt = Date.now() / 1000;
   const container = el('timeline-container');
   container.innerHTML = data.stops.map(s => {
     let busHtml = '';
@@ -733,6 +737,8 @@ async function loadRouteStatus() {
         ${busHtml}${branchHtml}
       </div>
       ${ubikeHtml ? `<div class="station-info-ubike">${ubikeHtml}</div>` : ''}
+      ${(ageBase !== null && tickAttrs && !s.is_schedule_estimate)
+        ? `<div class="eta-age" style="font-size:12px;color:#888;" data-age-base="${ageBase}" data-age-at="${ageAt}"></div>` : ''}
     </div>
     <span class="time-badge ${s.badge_class}"${tickAttrs}>${esc(s.eta_text)}</span>
   </div>
@@ -774,8 +780,19 @@ function startEtaTicker() {
 function stopEtaTicker() {
   if (etaTickTimer) { clearInterval(etaTickTimer); etaTickTimer = null; }
 }
+function formatDataAge(sec) {
+  if (sec < 60) return '資料剛更新';
+  return `資料 ${Math.floor(sec / 60)} 分鐘前`;
+}
 function tickEtaCountdowns() {
   const nowSec = Date.now() / 1000;
+  document.querySelectorAll('#timeline-container .eta-age[data-age-base]').forEach(tag => {
+    const base = parseFloat(tag.dataset.ageBase), at = parseFloat(tag.dataset.ageAt);
+    if (isNaN(base) || isNaN(at)) return;
+    const age = base + (nowSec - at);
+    tag.textContent = formatDataAge(age);
+    tag.style.color = age >= 600 ? '#d35400' : '#888';   // 超過 10 分鐘用橘色提醒
+  });
   document.querySelectorAll('#timeline-container .time-badge[data-eta-seconds]').forEach(badge => {
     const baseSeconds = parseFloat(badge.dataset.etaSeconds);
     const fetchedAt = parseFloat(badge.dataset.fetchedAt);
@@ -911,17 +928,41 @@ async function advancedSearch() {
   try {
     const data = await api(`/api/advanced_search?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`);
     let html = '';
-    if (data.directs && data.directs.length) {
-      html += `<div class="success-box">✅ 直達路線（共 ${data.directs.length} 條）</div>`;
-      html += data.directs.map(r => `<div class="route-item"><button class="btn adv-go" data-r="${esc(r)}">🚌 ${esc(r)}</button></div>`).join('');
+    // 下一班資訊：有現成的到站快照才有（沒有就不顯示，不影響其他內容）
+    const nextTxt = m => (m === null || m === undefined) ? ''
+      : (m <= 2 ? '・下一班即將進站' : `・下一班約 ${m} 分鐘`);
+    if (data.direct_plans) {
+      // 新版：依方向、依站序規劃（站數少的在前，附方向與下一班）
+      if (data.direct_plans.length) {
+        html += `<div class="success-box">✅ 直達（共 ${data.direct_plans.length} 個方案）</div>`;
+        html += data.direct_plans.map(p => `<div class="route-item"><button class="btn adv-go" data-r="${esc(p.route)}">🚌 ${esc(p.route)}</button> 往 <b>${esc(p.dest)}</b>・約 ${p.stops} 站${nextTxt(p.next_min)}</div>`).join('');
+      } else {
+        html += '<div class="info-box">無直達路線</div>';
+      }
+      if (data.transfer_plans && data.transfer_plans.length) {
+        html += `<div class="warning-box">🔄 轉乘一次方案（共 ${data.transfer_plans.length} 個，依站數排序）</div>`;
+        html += data.transfer_plans.map(t => {
+          const walk = t.walk_m > 0 ? `，步行約 ${t.walk_m} 公尺到「${esc(t.board_b)}」` : '';
+          return `<div class="route-item">搭 <button class="btn adv-go" data-r="${esc(t.routeA)}">🚌 ${esc(t.routeA)}</button> 往 <b>${esc(t.destA)}</b>（${t.stopsA} 站）→ 在 <b>${esc(t.transfer)}</b> 下車${walk}，轉搭 <button class="btn adv-go" data-r="${esc(t.routeB)}">🚌 ${esc(t.routeB)}</button> 往 <b>${esc(t.destB)}</b>（${t.stopsB} 站）・共約 ${t.total_stops} 站${nextTxt(t.next_min)}</div>`;
+        }).join('');
+        html += '<div class="caption">※ 只計算搭乘站數，不含轉乘等車時間；下一班指的是第一段車。</div>';
+      } else if (!data.direct_plans.length) {
+        html += '<div class="error-box">找不到直達或一次轉乘方案，請考慮其他方式</div>';
+      }
     } else {
-      html += '<div class="info-box">無直達路線</div>';
-    }
-    if (data.transfers && data.transfers.length) {
-      html += `<div class="warning-box">🔄 轉乘一次方案（共 ${data.transfers.length} 個）</div>`;
-      html += data.transfers.map(t => `<div class="route-item">搭 <b>${esc(t.routeA)}</b> → 在 <b>${esc(t.transfer)}</b> 轉 <b>${esc(t.routeB)}</b></div>`).join('');
-    } else {
-      html += '<div class="error-box">找不到一次轉乘方案，請考慮其他方式</div>';
+      // 舊版後備（站序資料還沒準備好時）
+      if (data.directs && data.directs.length) {
+        html += `<div class="success-box">✅ 直達路線（共 ${data.directs.length} 條）</div>`;
+        html += data.directs.map(r => `<div class="route-item"><button class="btn adv-go" data-r="${esc(r)}">🚌 ${esc(r)}</button></div>`).join('');
+      } else {
+        html += '<div class="info-box">無直達路線</div>';
+      }
+      if (data.transfers && data.transfers.length) {
+        html += `<div class="warning-box">🔄 轉乘一次方案（共 ${data.transfers.length} 個）</div>`;
+        html += data.transfers.map(t => `<div class="route-item">搭 <b>${esc(t.routeA)}</b> → 在 <b>${esc(t.transfer)}</b> 轉 <b>${esc(t.routeB)}</b></div>`).join('');
+      } else {
+        html += '<div class="error-box">找不到一次轉乘方案，請考慮其他方式</div>';
+      }
     }
     box.innerHTML = html;
     box.querySelectorAll('.adv-go').forEach(b => b.addEventListener('click', () => selectRouteByName(b.dataset.r)));
