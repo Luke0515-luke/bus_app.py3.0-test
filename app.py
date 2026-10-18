@@ -323,7 +323,7 @@ _usage_thread_lock = threading.Lock()
 
 
 def _usage_blank(month):
-    return {"month": month, "count": 0, "by_kind": {}, "manual_day": "", "manual_count": 0}
+    return {"month": month, "count": 0, "by_kind": {}, "by_source": {}, "by_day": {}, "manual_day": "", "manual_count": 0}
 
 
 def _tdx_usage_txn(fn):
@@ -360,7 +360,7 @@ def _tdx_usage_txn(fn):
                 lock_fp.close()
 
 
-def tdx_budget_consume(kind):
+def tdx_budget_consume(kind, source=None):
     """發 TDX 請求「之前」呼叫：還有額度就扣一次並回傳 True，沒額度回傳 False（呼叫端就不能發請求）。
     kind：'static'（每月靜態資料）、'dynamic'（到站／定位／UBike 排程）、'manual'（網頁手動按鈕）。"""
     def txn(u):
@@ -376,6 +376,13 @@ def tdx_budget_consume(kind):
             u["manual_count"] += 1
         u["count"] += 1
         u["by_kind"][kind] = u["by_kind"].get(kind, 0) + 1
+        # 儀表板用：依來源（eta／ubike／positions／static／manual）與依日期再各記一份
+        src = source or kind
+        bs = u.setdefault("by_source", {})
+        bs[src] = bs.get(src, 0) + 1
+        bd = u.setdefault("by_day", {})
+        day_key = _taipei_now().strftime("%d")
+        bd[day_key] = bd.get(day_key, 0) + 1
         return True
     try:
         return _tdx_usage_txn(txn)
@@ -961,7 +968,7 @@ def tdx_headers():
     return {'authorization': f'Bearer {get_tdx_token()}', 'Accept-Encoding': 'gzip'}
 
 
-def tdx_get(url, timeout=8, retries=0, kind="dynamic"):
+def tdx_get(url, timeout=8, retries=0, kind="dynamic", source=None):
     """整個程式『唯一』對 TDX 資料 API 發請求的出入口。每發一次請求（不管成功失敗）
     都先過 tdx_budget_consume() 扣一次月額度，額度用完就直接回傳 None、不發請求。
     retries 預設改成 0：重試也是一次計費的請求，3000 次額度很緊，失敗就等下一輪排程再抓。
@@ -972,7 +979,7 @@ def tdx_get(url, timeout=8, retries=0, kind="dynamic"):
         return None
     headers = {'authorization': f'Bearer {token}', 'Accept-Encoding': 'gzip'}
     for attempt in range(retries + 1):
-        if not tdx_budget_consume(kind):
+        if not tdx_budget_consume(kind, source):
             print(f"⛔ TDX 本月額度已達上限（或手動額度用完），略過請求：{url.split('?')[0]}", flush=True)
             return None
         try:
@@ -1027,7 +1034,7 @@ def fetch_bus_data_all():
     整個台南只算 1 次請求。失敗回傳 None（等下一輪排程，不即時重試、也不退回逐條路線查詢——
     那一輪就要一百多次請求，3000 次的月額度撐不住）。"""
     url = "https://tdx.transportdata.tw/api/basic/v2/Bus/EstimatedTimeOfArrival/City/Tainan?%24format=JSON"
-    res = tdx_get(url, timeout=30, retries=0, kind="dynamic")
+    res = tdx_get(url, timeout=30, retries=0, kind="dynamic", source="eta")
     if res is not None:
         try:
             data = res.json()
@@ -1509,6 +1516,11 @@ def _eta_poll_once(interval, push=True):
             _realtime_cache["last_attempt_ok"] = ok
             count = sum(len(v) for v in (_realtime_cache["eta_by_route"] or {}).values())
         _write_realtime_snapshot(write_eta=ok)
+        if ok:
+            try:
+                headway_record(eta_by_route, _realtime_cache.get("eta_fetched_at") or time.time())
+            except Exception as e:
+                print(f"⚠️ 班距統計記錄失敗（不影響服務）：{e}", flush=True)
 
         global _last_realtime_push_at
         if push and time.time() - _last_realtime_push_at >= REALTIME_PUSH_MIN_INTERVAL:
@@ -1547,7 +1559,7 @@ def _ubike_poll_once():
             return
         _ubike_last_attempt = time.time()
         url = "https://tdx.transportdata.tw/api/basic/v2/Bike/Availability/City/Tainan?%24format=JSON"
-        res = tdx_get(url, timeout=20, retries=0, kind="dynamic")
+        res = tdx_get(url, timeout=20, retries=0, kind="dynamic", source="ubike")
         if res is None:
             return
         try:
@@ -1565,7 +1577,7 @@ def _ubike_poll_once():
 def _fetch_bus_realtime_positions_from_tdx():
     """向 TDX 查『全台南』即時公車定位 1 次。失敗回傳 None。"""
     url = "https://tdx.transportdata.tw/api/basic/v2/Bus/RealTimeByFrequency/City/Tainan?%24format=JSON"
-    res = tdx_get(url, timeout=30, retries=0, kind="dynamic")
+    res = tdx_get(url, timeout=30, retries=0, kind="dynamic", source="positions")
     if res is not None:
         try:
             data = res.json()
@@ -2111,6 +2123,10 @@ def estimate_plan_times(start, plans):
         if wait is None:
             offs = _schedule_arrival_offsets(p["route"], p["dir"], p.get("board_idx", 0))
             wait, src = (offs[0] if offs else None), "時刻表"
+        if wait is None:
+            hw = headway_lookup(p["route"], p["dir"])
+            if hw:
+                wait, src = hw["median"] * 30.0, "班距"
         ride = p["stops"] * PLAN_MIN_PER_STOP * 60
         total = None if wait is None else wait + ride
         out[p["id"]] = {
@@ -2124,6 +2140,10 @@ def estimate_plan_times(start, plans):
         if wait1 is None:
             offs = _schedule_arrival_offsets(p["routeA"], p["dirA"], p.get("boardIdxA", 0))
             wait1, src1 = (offs[0] if offs else None), "時刻表"
+        if wait1 is None:
+            hw = headway_lookup(p["routeA"], p["dirA"])
+            if hw:
+                wait1, src1 = hw["median"] * 30.0, "班距"
         ride1 = p["stopsA"] * PLAN_MIN_PER_STOP * 60
         walk = (p.get("walk_m", 0) or 0) / PLAN_WALK_MPS
         ride2 = p["stopsB"] * PLAN_MIN_PER_STOP * 60
@@ -2144,6 +2164,10 @@ def estimate_plan_times(start, plans):
             live = _next_bus_seconds(p["routeB"], p["dirB"], p["board_b"])
             if live is not None and live >= ready_b:
                 wait2, src2 = live - ready_b, "即時"
+        if wait2 is None:
+            hw = headway_lookup(p["routeB"], p["dirB"])
+            if hw:
+                wait2, src2 = hw["median"] * 30.0, "班距"
         rec["partial_min"] = _fmt_min(ready_b + ride2)       # 不含第二班車等待時間的最短時間
         if wait2 is not None:
             total = ready_b + wait2 + ride2
@@ -3180,6 +3204,293 @@ def api_save_route_data():
         "stop_count": stop_count,
         "shape_ok": bool(shape_data),
         "stop_ok": bool(stop_data),
+    })
+
+
+
+# ══════════════════════════════════════════════════════════
+# 歷史班距統計：把每次抓到的到站預估「順便」整理成班距資料（完全不多打 TDX）
+# ══════════════════════════════════════════════════════════
+# 做法：每條路線、每個方向挑一個「參考站」（站序中間那一站），每次到站快照取該站
+# 『下一班』的預測到站時間；同一班車的預測會隨快照更新、合併成一筆，等它的預測時間
+# 過去了就定案，跟上一班定案時間相減就是一個「班距」。再依「上班日／假日」與「小時」
+# 分桶，每桶只留最近 12 筆，取中位數（漏抓一班造成的雙倍班距不會把平均拉高）。
+# 限制：快照間隔離峰是 15 分鐘，班距短於這個值的路線會因為漏抓而偏長，樣本數也會
+# 偏少，所以只有樣本夠（>=3）才會被拿來用。
+HEADWAY_FILE = os.path.join(DATA_DIR, "headway_stats.json")
+HEADWAY_MIN_GAP_MIN = 2
+HEADWAY_MAX_GAP_MIN = 90
+HEADWAY_KEEP_PER_BUCKET = 12
+HEADWAY_MIN_SAMPLES = 3
+_headway_write_lock = threading.Lock()
+
+
+def _headway_daytype(dt):
+    return "wd" if is_workday(dt) else "we"
+
+
+def headway_record(eta_by_route, fetch_ts):
+    """每次到站快照更新後呼叫一次（只在拿到鎖的那個 worker 呼叫）。"""
+    tz = _taipei_now().tzinfo
+    with _headway_write_lock:
+        try:
+            with open(HEADWAY_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
+        routes = data.setdefault("routes", {})
+        changed = False
+        for rname, items in (eta_by_route or {}).items():
+            by_dir = {}
+            for it in items:
+                d = it.get("Direction")
+                if d in (0, 1):
+                    by_dir.setdefault(d, []).append(it)
+            for d, its in by_dir.items():
+                key = f"{rname}|{d}"
+                rec = routes.get(key)
+                if rec is None:
+                    seqd = sorted((x for x in its if x.get("StopSequence") is not None),
+                                  key=lambda x: x["StopSequence"])
+                    if not seqd:
+                        continue
+                    ref = (seqd[len(seqd) // 2].get("StopName") or {}).get("Zh_tw")
+                    if not ref:
+                        continue
+                    rec = routes[key] = {"stop": ref, "pending": [], "last_final": None,
+                                         "bins": {"wd": {}, "we": {}}}
+                cand = None
+                for x in its:
+                    if (x.get("StopName") or {}).get("Zh_tw") == rec["stop"] and x.get("EstimateTime") is not None:
+                        if cand is None or x["EstimateTime"] < cand["EstimateTime"]:
+                            cand = x
+                if cand is not None and cand["EstimateTime"] <= 2400:
+                    arr = int(fetch_ts + cand["EstimateTime"])
+                    plate = cand.get("PlateNumb") or ""
+                    if plate in ("-1", "無車牌"):
+                        plate = ""
+                    for ev in rec["pending"]:
+                        if (plate and ev[1] == plate and abs(ev[0] - arr) <= 900) or abs(ev[0] - arr) <= 120:
+                            ev[0], ev[1] = arr, (plate or ev[1])
+                            break
+                    else:
+                        rec["pending"].append([arr, plate])
+                    changed = True
+                # 預測時間已經過去的就定案
+                rec["pending"].sort()
+                keep = []
+                for ev in rec["pending"]:
+                    if ev[0] < fetch_ts - 60:
+                        prev = rec.get("last_final")
+                        if prev is not None:
+                            gap = (ev[0] - prev) / 60.0
+                            if HEADWAY_MIN_GAP_MIN <= gap <= HEADWAY_MAX_GAP_MIN:
+                                dt = datetime.fromtimestamp(ev[0], tz)
+                                bucket = rec["bins"][_headway_daytype(dt)].setdefault(str(dt.hour), [])
+                                bucket.append(round(gap, 1))
+                                del bucket[:-HEADWAY_KEEP_PER_BUCKET]
+                        rec["last_final"] = ev[0]
+                        changed = True
+                    else:
+                        keep.append(ev)
+                rec["pending"] = keep[-6:]
+        if changed:
+            data["updated_at"] = int(fetch_ts)
+            _atomic_write_json(HEADWAY_FILE, data)
+
+
+def _median(vals):
+    v = sorted(vals)
+    n = len(v)
+    return None if not n else (v[n // 2] if n % 2 else (v[n // 2 - 1] + v[n // 2]) / 2.0)
+
+
+def headway_lookup(route, direction, now=None):
+    """這條路線現在這個時段（上班日／假日 × 小時）的歷史班距中位數（分鐘）；樣本不夠回傳 None。"""
+    now = now or _taipei_now()
+    data = _read_json_cached(HEADWAY_FILE, {})
+    rec = (data.get("routes") or {}).get(f"{route}|{direction}")
+    if not rec:
+        return None
+    bins = rec["bins"].get(_headway_daytype(now), {})
+    gaps = list(bins.get(str(now.hour), []))
+    if len(gaps) < HEADWAY_MIN_SAMPLES:        # 這個小時樣本不夠，併入前後一小時一起看
+        gaps += bins.get(str((now.hour - 1) % 24), []) + bins.get(str((now.hour + 1) % 24), [])
+    if len(gaps) < HEADWAY_MIN_SAMPLES:
+        return None
+    return {"median": _median(gaps), "n": len(gaps)}
+
+
+@app.route('/api/headway')
+def api_headway():
+    """某路線的歷史班距統計（依方向、上班日／假日、小時）。"""
+    route = request.args.get('route', '').strip()
+    if not route:
+        return jsonify({"error": "缺少路線名稱"}), 400
+    now = _taipei_now()
+    data = _read_json_cached(HEADWAY_FILE, {})
+    out = []
+    for d in (0, 1):
+        rec = (data.get("routes") or {}).get(f"{route}|{d}")
+        if not rec:
+            continue
+        table = {}
+        for dt_key in ("wd", "we"):
+            rows = []
+            for h in range(24):
+                g = rec["bins"].get(dt_key, {}).get(str(h), [])
+                if g:
+                    rows.append({"hour": h, "median": round(_median(g), 1), "n": len(g)})
+            table[dt_key] = rows
+        out.append({"direction": d, "ref_stop": rec["stop"], "table": table,
+                    "now": headway_lookup(route, d, now)})
+    return jsonify({"route": route, "directions": out,
+                    "daytype_now": _headway_daytype(now), "hour_now": now.hour,
+                    "min_samples": HEADWAY_MIN_SAMPLES})
+
+
+
+# ══════════════════════════════════════════════════════════
+# 用量儀表板：/admin/usage（頁面）＋ /api/usage（資料）
+# 有設定 ADMIN_TOKEN 環境變數時，需要帶 ?token=ADMIN_TOKEN 才能看
+# ══════════════════════════════════════════════════════════
+USAGE_DASHBOARD_HTML = r"""<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TDX 用量儀表板</title>
+<style>
+:root{--bg:#04110d;--panel:#0a1f19;--line:#164036;--text:#eef1f8;--muted:#92a0c4;--ok:#2dd4bf;--warn:#f5a524;--bad:#ff6b6b}
+*{box-sizing:border-box;margin:0;padding:0;font-family:'Noto Sans TC',-apple-system,sans-serif}
+body{background:var(--bg);color:var(--text);padding:16px;max-width:960px;margin:0 auto}
+h1{font-size:20px;margin-bottom:4px}.sub{color:var(--muted);font-size:12px;margin-bottom:14px}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));margin-bottom:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+.card h2{font-size:13px;color:var(--muted);font-weight:500;margin-bottom:6px}
+.big{font-size:30px;font-weight:700}.unit{font-size:13px;color:var(--muted);margin-left:4px}
+.bar{height:14px;background:#0e1a16;border-radius:999px;overflow:hidden;position:relative;margin:8px 0 4px;border:1px solid var(--line)}
+.bar>i{display:block;height:100%;background:var(--ok);transition:width .4s}
+.bar>b{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--warn)}
+.row{display:grid;grid-template-columns:110px 1fr 90px;gap:8px;align-items:center;padding:5px 0;font-size:13px}
+.row .bar{margin:0;height:10px}.row span:last-child{text-align:right;color:var(--muted)}
+.status{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700}
+.s-ok{background:rgba(45,212,191,.16);color:var(--ok)}.s-warn{background:rgba(245,165,36,.16);color:var(--warn)}.s-bad{background:rgba(255,107,107,.16);color:var(--bad)}
+.days{display:flex;align-items:flex-end;gap:3px;height:110px;margin-top:8px}
+.days div{flex:1;background:var(--ok);border-radius:3px 3px 0 0;min-height:1px;position:relative;opacity:.85}
+.days div.today{background:var(--warn);opacity:1}.days div.fut{background:#13302a}
+.axis{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:3px}
+.small{font-size:12px;color:var(--muted);line-height:1.6}
+#login{display:none;max-width:360px;margin:60px auto}
+input{width:100%;padding:10px;border-radius:8px;border:1px solid var(--line);background:#0e1a16;color:var(--text);margin:8px 0}
+button{padding:10px 14px;border-radius:8px;border:0;background:var(--ok);color:#03211b;font-weight:700;cursor:pointer;width:100%}
+@media(max-width:480px){.big{font-size:26px}.row{grid-template-columns:90px 1fr 70px}}
+</style></head><body>
+<div id="login" class="card"><h2>需要管理密碼</h2><input id="tok" type="password" placeholder="ADMIN_TOKEN"><button onclick="saveTok()">進入</button><div id="loginErr" class="small" style="color:var(--bad)"></div></div>
+<div id="main" style="display:none">
+<h1>📊 TDX 用量儀表板</h1><div class="sub" id="sub"></div>
+<div class="grid">
+ <div class="card"><h2>本月已用</h2><div><span class="big" id="used">-</span><span class="unit" id="cap"></span></div>
+  <div class="bar"><i id="usedBar"></i><b id="paceMark" title="按日期比例該有的進度"></b></div>
+  <div class="small" id="pace"></div></div>
+ <div class="card"><h2>預估月底用量</h2><div><span class="big" id="proj">-</span><span class="unit">次</span></div>
+  <div style="margin-top:8px"><span class="status" id="status">-</span></div><div class="small" id="projNote" style="margin-top:6px"></div></div>
+ <div class="card"><h2>目前排程</h2><div class="small" id="sched"></div></div>
+</div>
+<div class="card" style="margin-bottom:12px"><h2>用量來源占比</h2><div id="sources"></div></div>
+<div class="card"><h2>每日用量</h2><div class="days" id="days"></div><div class="axis"><span>1 日</span><span id="axMid"></span><span id="axEnd"></span></div></div>
+<p class="small" style="margin-top:12px">橘色刻度＝依日期比例該有的進度；程式有兩道保險：即時資料用到 2780 次就停、離峰輪詢會在用量超前時自動跳過。每 30 秒自動更新。</p>
+</div>
+<script>
+const LABELS={eta:'🚌 到站預估',ubike:'🚲 UBike 可借可還',positions:'📍 公車定位',static:'🗂️ 靜態資料（每月）',manual:'🛠️ 手動／測試',dynamic:'⚙️ 其他即時'};
+const COLORS={eta:'#2dd4bf',ubike:'#60a5fa',positions:'#c084fc',static:'#f5a524',manual:'#ff6b6b',dynamic:'#92a0c4'};
+let TOKEN=new URLSearchParams(location.search).get('token')||sessionStorage.getItem('adm')||'';
+function saveTok(){TOKEN=document.getElementById('tok').value.trim();sessionStorage.setItem('adm',TOKEN);load();}
+async function load(){
+  try{
+    const r=await fetch('/api/usage'+(TOKEN?'?token='+encodeURIComponent(TOKEN):''));
+    if(r.status===401){document.getElementById('login').style.display='block';document.getElementById('main').style.display='none';document.getElementById('loginErr').textContent=TOKEN?'密碼不正確':'';return;}
+    const d=await r.json();render(d);
+  }catch(e){document.getElementById('sub').textContent='讀取失敗：'+e.message;}
+}
+function render(d){
+  document.getElementById('login').style.display='none';document.getElementById('main').style.display='block';
+  document.getElementById('sub').textContent=`台北時間 ${d.now}・${d.month} 月（第 ${d.day}/${d.days_in_month} 天）`;
+  document.getElementById('used').textContent=d.used;document.getElementById('cap').textContent='/ '+d.cap+' 次';
+  const pct=Math.min(100,d.used/d.cap*100);const bar=document.getElementById('usedBar');
+  bar.style.width=pct+'%';bar.style.background=d.used>=d.cap*0.97?'#ff6b6b':(d.used>d.expected_by_now+150?'#f5a524':'#2dd4bf');
+  document.getElementById('paceMark').style.left=Math.min(100,d.expected_by_now/d.cap*100)+'%';
+  const diff=d.used-Math.round(d.expected_by_now);
+  document.getElementById('pace').textContent=`依日期進度約該用 ${Math.round(d.expected_by_now)} 次（${diff>=0?'超前':'落後'} ${Math.abs(diff)} 次）・剩餘 ${Math.max(0,d.cap-d.used)} 次`;
+  document.getElementById('proj').textContent=d.projected==null?'—':d.projected;
+  const st=document.getElementById('status');
+  const lvl=d.level;st.className='status '+(lvl==='ok'?'s-ok':lvl==='warn'?'s-warn':'s-bad');
+  st.textContent=lvl==='ok'?'✅ 不會超標':lvl==='warn'?'⚠️ 接近上限':'⛔ 有超標風險';
+  document.getElementById('projNote').textContent=d.projected==null?'月初資料還不夠，先不預估':`依目前速度推算，月底約 ${d.projected} 次（上限 ${d.cap}）`;
+  const iv=d.poll_interval_minutes;
+  document.getElementById('sched').innerHTML=[
+    '服務時段：'+(d.service_hours?'營運中':'收班（不抓資料）'),
+    '到站預估間隔：'+(iv?iv+' 分鐘':'—'),
+    '今天是否上班日：'+(d.workday_today?'是':'否'),
+    '有人使用中：'+(d.user_active?'是':'否（離峰輪詢暫停）'),
+    '到站資料年齡：'+(d.eta_age_seconds==null?'—':Math.round(d.eta_age_seconds/60)+' 分鐘')
+  ].join('<br>');
+  const total=Object.values(d.by_source).reduce((a,b)=>a+b,0)||1;
+  const rows=Object.entries(d.by_source).sort((a,b)=>b[1]-a[1]).map(([k,v])=>
+    `<div class="row"><span>${LABELS[k]||k}</span><div class="bar"><i style="width:${v/total*100}%;background:${COLORS[k]||'#92a0c4'}"></i></div><span>${v}（${Math.round(v/total*100)}%）</span></div>`).join('');
+  document.getElementById('sources').innerHTML=rows||'<div class="small">這個月還沒有資料</div>';
+  const max=Math.max(1,...d.daily.map(x=>x.count||0));
+  document.getElementById('days').innerHTML=d.daily.map(x=>
+    `<div class="${x.day===d.day?'today':(x.day>d.day?'fut':'')}" style="height:${x.day>d.day?3:Math.max(2,(x.count||0)/max*100)}%" title="${x.day} 日：${x.count} 次"></div>`).join('');
+  document.getElementById('axMid').textContent=Math.ceil(d.days_in_month/2)+' 日';document.getElementById('axEnd').textContent=d.days_in_month+' 日';
+}
+load();setInterval(load,30000);
+</script></body></html>
+"""
+
+
+def _admin_ok():
+    tok = os.environ.get("ADMIN_TOKEN", "")
+    if not tok:
+        return True
+    given = request.args.get("token", "") or request.headers.get("X-Admin-Token", "")
+    return given == tok
+
+
+@app.route('/admin/usage')
+def admin_usage_page():
+    return app.response_class(USAGE_DASHBOARD_HTML, mimetype='text/html')
+
+
+@app.route('/api/usage')
+def api_usage():
+    if not _admin_ok():
+        return jsonify({"error": "需要管理密碼"}), 401
+    now = _taipei_now()
+    u = tdx_usage_snapshot()
+    used = int(u.get("count", 0))
+    dim = calendar.monthrange(now.year, now.month)[1]
+    frac = ((now.day - 1) + (now.hour * 60 + now.minute) / 1440.0) / dim
+    expected = TDX_MONTHLY_CAP * frac
+    projected = int(round(used / frac)) if frac >= 0.03 else None
+    if used >= TDX_MONTHLY_CAP * 0.97 or (projected is not None and projected > TDX_MONTHLY_CAP):
+        level = "bad"
+    elif projected is not None and projected > TDX_MONTHLY_CAP * 0.92:
+        level = "warn"
+    else:
+        level = "ok"
+    by_day = u.get("by_day", {}) or {}
+    daily = [{"day": d, "count": int(by_day.get(f"{d:02d}", 0))} for d in range(1, dim + 1)]
+    interval = get_smart_poll_interval(now)
+    rt = get_realtime_status()
+    return jsonify({
+        "now": now.strftime("%Y-%m-%d %H:%M"), "month": u.get("month"), "day": now.day, "days_in_month": dim,
+        "used": used, "cap": TDX_MONTHLY_CAP, "expected_by_now": round(expected, 1),
+        "projected": projected, "level": level,
+        "by_source": u.get("by_source", {}) or {}, "by_kind": u.get("by_kind", {}) or {},
+        "daily": daily,
+        "service_hours": is_service_hours(now),
+        "poll_interval_minutes": None if interval is None else interval // 60,
+        "workday_today": is_workday(now), "user_active": is_user_active(),
+        "eta_age_seconds": rt.get("age_seconds"),
     })
 
 
