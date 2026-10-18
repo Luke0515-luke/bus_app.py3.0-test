@@ -193,7 +193,7 @@ def create_user_record(username, password_hash):
     users = _load_users()
     users[username] = {
         "password_hash": password_hash,
-        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "created": _taipei_now().strftime("%Y-%m-%d %H:%M:%S"),
     }
     _save_users(users)
     return True
@@ -716,7 +716,7 @@ async def backup():
             os.makedirs(backup_folder, exist_ok=True)
 
             # 備份檔案路徑
-            now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            now = _taipei_now().strftime("%Y-%m-%d_%H-%M-%S")
             backup_filename = f"backup_{now}.zip"
             backup_path = os.path.join(backup_folder, backup_filename)
 
@@ -936,9 +936,9 @@ def add_recent_route(state, route):
 
 
 def new_chat_session(state):
-    sid = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    sid = _taipei_now().strftime("%Y%m%d_%H%M%S_%f")
     state["chat_sessions"][sid] = {
-        "title": f"對話 {datetime.now().strftime('%m/%d %H:%M')}",
+        "title": f"對話 {_taipei_now().strftime('%m/%d %H:%M')}",
         "history": []
     }
     state["current_session_id"] = sid
@@ -1497,7 +1497,7 @@ def _eta_poll_once(interval, push=True):
     try:
         if not _eta_poll_due(interval):   # 搶到鎖之後再確認一次，避免別的 worker 剛抓完
             return False
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = _taipei_now().strftime("%Y-%m-%d %H:%M:%S")
         eta_all = fetch_bus_data_all()
         ok = eta_all is not None
         with _realtime_lock:
@@ -2260,7 +2260,7 @@ def _schedule_departure_times(route, direction):
     raw = fetch_route_schedule(route)
     if not raw:
         return []
-    now = datetime.now()
+    now = _taipei_now().replace(tzinfo=None)   # 時刻表是台北時間，伺服器預設常是 UTC，不能直接用 datetime.now()
     weekday_key = _WEEKDAY_KEYS[now.weekday()]
     times = []
     for entry in raw:
@@ -2289,7 +2289,7 @@ def estimate_eta_from_schedule(dep_times, stop_index):
     僅供參考用的備援估算，不是真正的即時動態，所以呼叫端要另外標示清楚。"""
     if not dep_times:
         return None
-    now = datetime.now()
+    now = _taipei_now().replace(tzinfo=None)
     offset = timedelta(seconds=stop_index * 120)
     best = None
     for dep_dt in dep_times:
@@ -2698,7 +2698,7 @@ def api_route_status():
     ][:30]  # 站數太多的路線只取前 30 站，避免塞爆 AI 的對話上下文
     bus_status = (
         f"路線：{route}（往{direction}方向，往{main_dest}）。"
-        f"資料擷取時間：{datetime.now().strftime('%H:%M:%S')}。"
+        f"資料擷取時間：{_taipei_now().strftime('%H:%M:%S')}。"
         f"逐站動態：{json.dumps(ai_stop_summary, ensure_ascii=False)}"
     )
     state["bus_status"] = bus_status
@@ -2804,7 +2804,7 @@ def api_reminders_add():
         "id": str(uuid.uuid4())[:8],
         "route": route, "direction": direction, "stop": stop,
         "alert_minutes": alert_minutes,
-        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "created": _taipei_now().strftime("%Y-%m-%d %H:%M:%S"),
     })
     return jsonify({"reminders": reminders})
 
@@ -2994,7 +2994,9 @@ def api_map_data():
         "routes": routes_to_draw,
         "saved_routes": sorted(get_saved_route_names()),
         "live_routes": sorted(live_route_set),
-        "now": datetime.now().strftime("%H:%M:%S"),
+        "now": _taipei_now().strftime("%H:%M:%S"),
+        "server_epoch": time.time(),
+        "positions_fetched_at": pos_status["fetched_at"],
         "service_closed": service_closed,
         "closed_message": SERVICE_CLOSED_MESSAGE if service_closed else "",
         "positions_age_seconds": _positions_age_seconds(pos_status["fetched_at"]),
@@ -3015,7 +3017,9 @@ def api_map_buses():
     return jsonify({
         "buses": bus_features,
         "live_routes": sorted(live_route_set),
-        "now": datetime.now().strftime("%H:%M:%S"),
+        "now": _taipei_now().strftime("%H:%M:%S"),
+        "server_epoch": time.time(),
+        "positions_fetched_at": pos_status["fetched_at"],
         "service_closed": service_closed,
         "closed_message": SERVICE_CLOSED_MESSAGE if service_closed else "",
         "positions_age_seconds": _positions_age_seconds(pos_status["fetched_at"]),
