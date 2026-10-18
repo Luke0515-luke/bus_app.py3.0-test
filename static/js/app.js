@@ -111,6 +111,7 @@ document.addEventListener('DOMContentLoaded', () => {
   renderHomeDate();
   loadHomeWeather();
   setInterval(loadHomeWeather, 10 * 60 * 1000); // 天氣後端本身快取 10 分鐘，前端跟著每 10 分鐘刷新一次就好
+  setInterval(renderMapClock, 1000);   // 地圖頁的「現在時間／資料幾分鐘前」每秒跟著真實時刻走
   applyUrlParams();   // 分享連結 ?route=33&stop=某站&dir=0
 });
 
@@ -1804,8 +1805,14 @@ async function loadMapData(forceRefresh) {
     buildShapeIndex();
     state.savedRoutes = data.saved_routes || [];
     state.mapActiveRoutes = new Set(data.routes); // 這次實際抓到、畫出來的路線
-    const staleNote = data.data_fresh === false ? '　｜　⚠️ 尚未更新資料' : '';
-    el('map-caption').textContent = `資料時間：${data.now}　｜　每次按「🔄 更新」重抓最新位置${staleNote}`;
+    // 以伺服器時間校正手機／電腦的時鐘誤差，畫面上的「現在時間」與「幾分鐘前」就是真實時刻
+    state.mapClock = {
+      skew: (typeof data.server_epoch === 'number') ? data.server_epoch - Date.now() / 1000 : 0,
+      fetchedAt: (typeof data.positions_fetched_at === 'number') ? data.positions_fetched_at : null,
+      closed: !!data.service_closed,
+      closedMsg: data.closed_message || '',
+    };
+    renderMapClock();
     drawMapShapes();
     drawMapStops();
     drawMapBuses();
@@ -1822,6 +1829,48 @@ async function loadMapData(forceRefresh) {
     stats.textContent = '載入失敗';
     stopMapAutoRefresh();
   }
+}
+
+// ── 地圖：現在時間（台北，依伺服器校正）＋ 定位資料是幾分鐘前 ───────────────
+function mapNowEpoch() {
+  const skew = (state.mapClock && state.mapClock.skew) || 0;
+  return Date.now() / 1000 + skew;
+}
+function fmtTaipeiTime(epoch, withSeconds) {
+  return new Date(epoch * 1000).toLocaleTimeString('zh-TW', {
+    timeZone: 'Asia/Taipei', hour12: false, hour: '2-digit', minute: '2-digit',
+    ...(withSeconds ? { second: '2-digit' } : {}),
+  });
+}
+function fmtAgeText(sec) {
+  if (sec < 60) return '剛更新';
+  if (sec < 3600) return `${Math.floor(sec / 60)} 分鐘前`;
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+  return m ? `${h} 小時 ${m} 分鐘前` : `${h} 小時前`;
+}
+function mapDataAgeText() {
+  const c = state.mapClock;
+  if (!c || c.fetchedAt === null) return '定位時間不明';
+  const age = Math.max(0, mapNowEpoch() - c.fetchedAt);
+  return `定位資料 ${fmtTaipeiTime(c.fetchedAt, false)} 抓取（${fmtAgeText(age)}）`;
+}
+function renderMapClock() {
+  const box = el('map-caption');
+  const c = state.mapClock;
+  if (!box || !c || box.offsetParent === null) return;   // 還沒載入、或地圖頁沒在顯示就不用更新
+  const now = mapNowEpoch();
+  let html = `<span class="mc-now">🕒 現在 <b>${fmtTaipeiTime(now, true)}</b></span>`;
+  if (c.closed) {
+    html += `<span class="mc-sep">｜</span><span>${esc(c.closedMsg || '🌙 已收班，不顯示公車定位')}</span>`;
+  } else if (c.fetchedAt === null) {
+    html += `<span class="mc-sep">｜</span><span>📍 目前沒有公車定位資料</span>`;
+  } else {
+    const age = Math.max(0, now - c.fetchedAt);
+    html += `<span class="mc-sep">｜</span><span>📍 定位資料 ${fmtTaipeiTime(c.fetchedAt, false)} 抓取・` +
+      `<b class="mc-age ${age > 65 * 60 ? 'old' : (age > 30 * 60 ? 'warn' : '')}">${fmtAgeText(age)}</b></span>` +
+      `<span class="mc-note">圖上公車位置每 5 分鐘依路線推進一站（推算，非即時定位）</span>`;
+  }
+  box.innerHTML = html;
 }
 
 function makeBusIcon(color) {
@@ -1903,9 +1952,10 @@ function drawMapBuses() {
     const startPos = b._motion ? busPositionAt(b._motion, elapsed) : [b.lat, b.lon];
     const marker = L.marker(startPos, { icon: makeBusIcon(b.color) });
     state.busMarkers.push({ marker, bus: b });
-    marker.bindPopup(`
+    marker.bindPopup(() => `
       <div class="bus-popup">
         <b>🚌 ${esc(b.route)}</b><br>
+        <span class="popup-age">📍 ${esc(mapDataAgeText())}・目前位置為依路線推算</span><br>
         <span class="tag" style="background:${b.color}">車牌：${esc(b.plate)}</span>
         <span class="tag" style="background:#555">方向：${esc(b.dir)}</span>
         <span class="tag" style="background:#333">速度：${esc(String(b.speed))} km/h</span>
