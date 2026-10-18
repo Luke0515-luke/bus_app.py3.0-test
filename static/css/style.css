@@ -639,3 +639,53 @@ body.theme-night .reminder-item { border-color: #262a38; }
   .plan-time { grid-column: 2; text-align: left; margin-top: -2px; }
   .plan-step::before { left: 11px; }
 }
+
+/* ── 資料年齡：放在到站時間旁邊（每筆預估都看得到）────────────────── */
+.eta-col { display: flex; flex-direction: column; align-items: center; gap: 3px; flex-shrink: 0; }
+.eta-age { font-size: 11px; color: #888; white-space: nowrap; line-height: 1.2; }
+.eta-age.age-warn { color: #d98200; }
+.eta-age.age-old { color: #d35400; font-weight: 700; }
+.eta-age-summary { font-size: 13px; background: #eef6ff; color: #2b3a67; border-radius: 8px; padding: 7px 12px; margin: 8px 0; line-height: 1.5; }
+.eta-age-summary .caption { display: block; margin: 2px 0 0; }
+.eta-age-summary.stale { background: #fff1e6; color: #a04000; }
+body.theme-night .eta-age { color: #9aa4c0; }
+body.theme-night .eta-age.age-warn { color: #f0b04a; }
+body.theme-night .eta-age.age-old { color: #ff9d6b; }
+body.theme-night .eta-age-summary { background: #17233d; color: #cfe0ff; }
+body.theme-night .eta-age-summary.stale { background: #3a2412; color: #ffc29a; }
+
+/* ── 每站分享小按鈕 ──────────────────────────────────────── */
+.stop-share { border: 0; background: transparent; cursor: pointer; font-size: 13px; padding: 2px 4px; border-radius: 6px; opacity: .55; line-height: 1; }
+.stop-share:hover, .stop-share:focus-visible { opacity: 1; background: rgba(74,144,226,.15); }
+
+/* ── 分享連結／QR code／歷史班距 ─────────────────────────── */
+#route-extras { margin: 10px 0; display: flex; flex-direction: column; gap: 8px; }
+.hw-box { background: #f4f0ff; color: #3b2d6b; border-radius: 10px; padding: 10px 12px; }
+.hw-title { font-weight: 700; font-size: 13px; margin-bottom: 4px; }
+.hw-dir { margin-top: 4px; }
+.hw-line { font-size: 14px; }
+.hw-line b { font-size: 17px; }
+.hw-more { margin-top: 4px; font-size: 12px; }
+.hw-more summary { cursor: pointer; color: #6b4fd8; padding: 4px 0; }
+.hw-chips { display: flex; flex-wrap: wrap; gap: 5px; margin: 6px 0; }
+.hw-chip { background: #fff; border: 1px solid #d9d0f5; border-radius: 999px; padding: 2px 9px; font-size: 12px; white-space: nowrap; }
+.hw-chip.now { background: #6b4fd8; border-color: #6b4fd8; color: #fff; }
+.share-box { background: #f5f9ff; color: #1f2d4d; border: 1px solid #cfe0ff; border-radius: 12px; padding: 12px; text-align: center; }
+.share-title { font-weight: 700; margin-bottom: 8px; word-break: break-word; }
+.share-qr { display: flex; justify-content: center; align-items: center; min-height: 196px; }
+.share-qr > div, .share-qr img, .share-qr canvas { background: #fff; padding: 10px; border-radius: 10px; border: 1px solid #dfe7f5; }
+.share-url { width: 100%; margin: 10px 0 8px; padding: 8px 10px; font-size: 12px; border: 1px solid #cfd8ea; border-radius: 8px; background: #fff; color: #333; }
+.share-actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: center; margin-bottom: 6px; }
+body.theme-night .hw-box { background: #251f3d; color: #e4dcff; }
+body.theme-night .hw-more summary { color: #b9a6ff; }
+body.theme-night .hw-chip { background: #1a1530; border-color: #3d3366; color: #e4dcff; }
+body.theme-night .share-box { background: #17233d; color: #cfe0ff; border-color: #2a3a63; }
+body.theme-night .share-url { background: #0f1527; color: #cfe0ff; border-color: #2a3a63; }
+
+.plan-src.hist { background: rgba(192,132,252,.18); color: #d4b5ff; }
+
+@media (max-width: 480px) {
+  .eta-age { font-size: 10px; }
+  .stop-share { font-size: 14px; padding: 4px 6px; }   /* 手機上好點一點 */
+  .share-qr { min-height: 180px; }
+}
