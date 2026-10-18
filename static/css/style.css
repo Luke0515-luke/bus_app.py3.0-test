@@ -689,3 +689,17 @@ body.theme-night .share-url { background: #0f1527; color: #cfe0ff; border-color:
   .stop-share { font-size: 14px; padding: 4px 6px; }   /* 手機上好點一點 */
   .share-qr { min-height: 180px; }
 }
+
+/* ── 地圖：現在時間＋定位資料年齡 ─────────────────────────── */
+#map-caption { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 6px; line-height: 1.5; }
+#map-caption .mc-now b { font-variant-numeric: tabular-nums; font-size: 14px; }
+#map-caption .mc-sep { opacity: .5; }
+#map-caption .mc-note { flex-basis: 100%; font-size: 11px; opacity: .8; }
+.mc-age { color: #1a9c6a; }
+.mc-age.warn { color: #d98200; }
+.mc-age.old { color: #d35400; }
+body.theme-night .mc-age { color: #5eead4; }
+body.theme-night .mc-age.warn { color: #f0b04a; }
+body.theme-night .mc-age.old { color: #ff9d6b; }
+.popup-age { font-size: 11px; color: #666; }
+@media (max-width: 480px) { #map-caption .mc-now b { font-size: 13px; } }
