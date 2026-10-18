@@ -917,55 +917,175 @@ function renderAdvStopOptions(keyword) {
     if (dl) dl.innerHTML = opts;
   });
 }
+// ── 站到站查詢：結果改成「卡片＋時間軸」，手機／電腦都一眼看懂每一段時間 ──
+let advLast = null;   // { start, end, data, times, meta }
+
+function fmtMin(m) {
+  if (m === null || m === undefined) return null;
+  if (m < 1) return '不到 1 分';
+  if (m < 60) return `${m} 分`;
+  const h = Math.floor(m / 60), r = m % 60;
+  return r ? `${h} 小時 ${r} 分` : `${h} 小時`;
+}
+function planSrcTag(src) {
+  if (!src) return '';
+  return `<span class="plan-src ${src === '即時' ? 'live' : 'sched'}">${esc(src)}</span>`;
+}
+// 一個時間軸步驟：左邊圖示＋軌道線、中間說明、右邊時間
+function planStep(icon, title, sub, time, cls) {
+  return `<li class="plan-step ${cls || ''}">` +
+    `<span class="plan-dot">${icon}</span>` +
+    `<div class="plan-body"><div class="plan-title">${title}</div>${sub ? `<div class="plan-sub">${sub}</div>` : ''}</div>` +
+    `<div class="plan-time">${time || ''}</div></li>`;
+}
+function planTimeCell(computed, min, src) {
+  if (!computed) return '<span class="plan-na">—</span>';
+  if (min === null || min === undefined) return '<span class="plan-na">無資料</span>';
+  return `<b>${fmtMin(min)}</b>${planSrcTag(src)}`;
+}
+function planTotalBlock(computed, t, fallbackText) {
+  if (!computed) return `<div class="plan-total"><span class="plan-total-main">${fallbackText}</span></div>`;
+  if (t && t.total_min != null) {
+    return `<div class="plan-total"><span class="plan-total-main">約 ${fmtMin(t.total_min)}</span>` +
+      (t.arrive ? `<span class="plan-total-sub">${esc(t.arrive)} 抵達</span>` : '') + `</div>`;
+  }
+  if (t && t.partial_min != null) {
+    return `<div class="plan-total"><span class="plan-total-main">至少 ${fmtMin(t.partial_min)}</span>` +
+      `<span class="plan-total-sub">不含第二班等車</span></div>`;
+  }
+  return '<div class="plan-total"><span class="plan-total-main plan-na">無法估算</span></div>';
+}
+
+function directPlanCard(p, t, start, end) {
+  const computed = !!t;
+  const next = (p.next_min === null || p.next_min === undefined) ? ''
+    : (p.next_min <= 2 ? '下一班即將進站' : `下一班約 ${p.next_min} 分鐘`);
+  const steps =
+    planStep('🚏', `在「${esc(start)}」等車`, computed ? '' : esc(next), planTimeCell(computed, t && t.wait1_min, t && t.wait1_src)) +
+    planStep('🚌', `搭 ${esc(p.route)} 往 <b>${esc(p.dest)}</b>`, `坐 ${p.stops} 站`, planTimeCell(computed, t && t.ride1_min)) +
+    planStep('🏁', `抵達「${esc(end)}」`, '', computed && t.arrive ? `<b>${esc(t.arrive)}</b>` : '<span class="plan-na">—</span>', 'last');
+  return `<div class="plan-card">` +
+    `<div class="plan-head"><div class="plan-routes"><button class="btn adv-go" data-r="${esc(p.route)}">🚌 ${esc(p.route)}</button>` +
+    `<span class="plan-meta">直達・${p.stops} 站</span></div>` +
+    planTotalBlock(computed, t, `${p.stops} 站`) + `</div>` +
+    `<ol class="plan-steps">${steps}</ol></div>`;
+}
+
+function transferPlanCard(p, t, start, end) {
+  const computed = !!t;
+  const next = (p.next_min === null || p.next_min === undefined) ? ''
+    : (p.next_min <= 2 ? '下一班即將進站' : `下一班約 ${p.next_min} 分鐘`);
+  const hasWalk = p.walk_m > 0;
+  const midStep = hasWalk
+    ? planStep('🚶', `步行約 ${p.walk_m} 公尺到「${esc(p.board_b)}」`, `在「${esc(p.transfer)}」下車後步行`, planTimeCell(computed, t && t.walk_min))
+    : planStep('🔄', `在「${esc(p.transfer)}」下車轉乘`, '同站轉乘', '');
+  const steps =
+    planStep('🚏', `在「${esc(start)}」等車`, computed ? '' : esc(next), planTimeCell(computed, t && t.wait1_min, t && t.wait1_src)) +
+    planStep('🚌', `搭 ${esc(p.routeA)} 往 <b>${esc(p.destA)}</b>`, `坐 ${p.stopsA} 站・到「${esc(p.transfer)}」`, planTimeCell(computed, t && t.ride1_min)) +
+    midStep +
+    planStep('🚏', `等 ${esc(p.routeB)} 往 <b>${esc(p.destB)}</b>`, '第二班車', planTimeCell(computed, t && t.wait2_min, t && t.wait2_src)) +
+    planStep('🚌', `搭 ${esc(p.routeB)}`, `坐 ${p.stopsB} 站・到「${esc(end)}」`, planTimeCell(computed, t && t.ride2_min)) +
+    planStep('🏁', `抵達「${esc(end)}」`, '', computed && t.arrive ? `<b>${esc(t.arrive)}</b>` : '<span class="plan-na">—</span>', 'last');
+  return `<div class="plan-card">` +
+    `<div class="plan-head"><div class="plan-routes">` +
+    `<button class="btn adv-go" data-r="${esc(p.routeA)}">🚌 ${esc(p.routeA)}</button><span class="plan-arrow">➜</span>` +
+    `<button class="btn adv-go" data-r="${esc(p.routeB)}">🚌 ${esc(p.routeB)}</button>` +
+    `<span class="plan-meta">轉乘 1 次・${p.total_stops} 站</span></div>` +
+    planTotalBlock(computed, t, `${p.total_stops} 站`) + `</div>` +
+    `<ol class="plan-steps">${steps}</ol></div>`;
+}
+
+// 算完時間後，依「總時間」由短到長排（估不出來的排後面）
+function planSortKey(t) {
+  if (!t) return 1e9;
+  if (t.total_min != null) return t.total_min;
+  if (t.partial_min != null) return 10000 + t.partial_min;
+  return 1e9;
+}
+
+function renderAdvResults() {
+  const box = el('adv-search-result');
+  if (!advLast) { box.innerHTML = ''; return; }
+  const { start, end, data, times, meta } = advLast;
+  let html = '';
+  if (data.direct_plans) {
+    const hasAny = (data.direct_plans.length || (data.transfer_plans && data.transfer_plans.length));
+    if (hasAny) {
+      const btnText = times ? '🔄 重新計算時間' : '⏱ 運算轉乘時間';
+      html += `<div class="plan-toolbar"><button id="btn-adv-times" class="btn btn-block">${btnText}</button>` +
+        `<div id="adv-times-msg" class="caption">${times
+          ? `現在 ${esc(meta.now)}・搭乘時間以每站約 ${meta.perStop} 分估算；等車依「即時」到站或「時刻表」`
+          : '按下按鈕，估算每個方案的等車、搭乘、步行與抵達時間'}</div></div>`;
+    }
+    const sortPlans = (arr, idOf) => {
+      const list = arr.slice();
+      if (times) list.sort((a, b) => planSortKey(times[idOf(a)]) - planSortKey(times[idOf(b)]));
+      return list;
+    };
+    const direct = sortPlans(data.direct_plans, p => p.id);
+    if (direct.length) {
+      html += `<div class="success-box">✅ 直達（共 ${direct.length} 個方案）</div><div class="plan-list">` +
+        direct.map(p => directPlanCard(p, times && times[p.id], start, end)).join('') + `</div>`;
+    } else {
+      html += '<div class="info-box">無直達路線</div>';
+    }
+    if (data.transfer_plans && data.transfer_plans.length) {
+      const trans = sortPlans(data.transfer_plans, p => p.id);
+      html += `<div class="warning-box">🔄 轉乘一次方案（共 ${trans.length} 個，${times ? '依總時間排序' : '依站數排序'}）</div><div class="plan-list">` +
+        trans.map(p => transferPlanCard(p, times && times[p.id], start, end)).join('') + `</div>`;
+      if (!times) html += '<div class="caption">※ 尚未運算時間，目前只列站數；「下一班」指的是第一段車。</div>';
+    } else if (!data.direct_plans.length) {
+      html += '<div class="error-box">找不到直達或一次轉乘方案，請考慮其他方式</div>';
+    }
+  } else {
+    // 舊版後備（站序資料還沒準備好時）
+    if (data.directs && data.directs.length) {
+      html += `<div class="success-box">✅ 直達路線（共 ${data.directs.length} 條）</div>`;
+      html += data.directs.map(r => `<div class="route-item"><button class="btn adv-go" data-r="${esc(r)}">🚌 ${esc(r)}</button></div>`).join('');
+    } else {
+      html += '<div class="info-box">無直達路線</div>';
+    }
+    if (data.transfers && data.transfers.length) {
+      html += `<div class="warning-box">🔄 轉乘一次方案（共 ${data.transfers.length} 個）</div>`;
+      html += data.transfers.map(t => `<div class="route-item">搭 <b>${esc(t.routeA)}</b> → 在 <b>${esc(t.transfer)}</b> 轉 <b>${esc(t.routeB)}</b></div>`).join('');
+    } else {
+      html += '<div class="error-box">找不到一次轉乘方案，請考慮其他方式</div>';
+    }
+  }
+  box.innerHTML = html;
+  box.querySelectorAll('.adv-go').forEach(b => b.addEventListener('click', () => selectRouteByName(b.dataset.r)));
+  const tb = el('btn-adv-times');
+  if (tb) tb.addEventListener('click', computePlanTimes);
+}
+
+async function computePlanTimes() {
+  if (!advLast) return;
+  const btn = el('btn-adv-times'), msg = el('adv-times-msg');
+  if (btn) { btn.disabled = true; btn.textContent = '運算中...'; }
+  try {
+    const r = await api(`/api/plan_times?start=${encodeURIComponent(advLast.start)}&end=${encodeURIComponent(advLast.end)}`);
+    advLast.times = r.times || {};
+    advLast.meta = { now: r.now || '', perStop: r.min_per_stop || 2 };
+    renderAdvResults();
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = advLast.times ? '🔄 重新計算時間' : '⏱ 運算轉乘時間'; }
+    if (msg) msg.innerHTML = `<span class="plan-err">${esc(e.message)}</span>`;
+  }
+}
+
 async function advancedSearch() {
   const start = el('adv-start').value.trim();
   const end = el('adv-end').value.trim();
   const box = el('adv-search-result');
   box.innerHTML = '';
+  advLast = null;
   if (!start || !end) { box.innerHTML = '<div class="error-box">請選擇出發站和目的站</div>'; return; }
   if (start === end) { box.innerHTML = '<div class="error-box">出發站和目的站不能相同</div>'; return; }
   box.innerHTML = '<div class="caption">搜尋中...</div>';
   try {
     const data = await api(`/api/advanced_search?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`);
-    let html = '';
-    // 下一班資訊：有現成的到站快照才有（沒有就不顯示，不影響其他內容）
-    const nextTxt = m => (m === null || m === undefined) ? ''
-      : (m <= 2 ? '・下一班即將進站' : `・下一班約 ${m} 分鐘`);
-    if (data.direct_plans) {
-      // 新版：依方向、依站序規劃（站數少的在前，附方向與下一班）
-      if (data.direct_plans.length) {
-        html += `<div class="success-box">✅ 直達（共 ${data.direct_plans.length} 個方案）</div>`;
-        html += data.direct_plans.map(p => `<div class="route-item"><button class="btn adv-go" data-r="${esc(p.route)}">🚌 ${esc(p.route)}</button> 往 <b>${esc(p.dest)}</b>・約 ${p.stops} 站${nextTxt(p.next_min)}</div>`).join('');
-      } else {
-        html += '<div class="info-box">無直達路線</div>';
-      }
-      if (data.transfer_plans && data.transfer_plans.length) {
-        html += `<div class="warning-box">🔄 轉乘一次方案（共 ${data.transfer_plans.length} 個，依站數排序）</div>`;
-        html += data.transfer_plans.map(t => {
-          const walk = t.walk_m > 0 ? `，步行約 ${t.walk_m} 公尺到「${esc(t.board_b)}」` : '';
-          return `<div class="route-item">搭 <button class="btn adv-go" data-r="${esc(t.routeA)}">🚌 ${esc(t.routeA)}</button> 往 <b>${esc(t.destA)}</b>（${t.stopsA} 站）→ 在 <b>${esc(t.transfer)}</b> 下車${walk}，轉搭 <button class="btn adv-go" data-r="${esc(t.routeB)}">🚌 ${esc(t.routeB)}</button> 往 <b>${esc(t.destB)}</b>（${t.stopsB} 站）・共約 ${t.total_stops} 站${nextTxt(t.next_min)}</div>`;
-        }).join('');
-        html += '<div class="caption">※ 只計算搭乘站數，不含轉乘等車時間；下一班指的是第一段車。</div>';
-      } else if (!data.direct_plans.length) {
-        html += '<div class="error-box">找不到直達或一次轉乘方案，請考慮其他方式</div>';
-      }
-    } else {
-      // 舊版後備（站序資料還沒準備好時）
-      if (data.directs && data.directs.length) {
-        html += `<div class="success-box">✅ 直達路線（共 ${data.directs.length} 條）</div>`;
-        html += data.directs.map(r => `<div class="route-item"><button class="btn adv-go" data-r="${esc(r)}">🚌 ${esc(r)}</button></div>`).join('');
-      } else {
-        html += '<div class="info-box">無直達路線</div>';
-      }
-      if (data.transfers && data.transfers.length) {
-        html += `<div class="warning-box">🔄 轉乘一次方案（共 ${data.transfers.length} 個）</div>`;
-        html += data.transfers.map(t => `<div class="route-item">搭 <b>${esc(t.routeA)}</b> → 在 <b>${esc(t.transfer)}</b> 轉 <b>${esc(t.routeB)}</b></div>`).join('');
-      } else {
-        html += '<div class="error-box">找不到一次轉乘方案，請考慮其他方式</div>';
-      }
-    }
-    box.innerHTML = html;
-    box.querySelectorAll('.adv-go').forEach(b => b.addEventListener('click', () => selectRouteByName(b.dataset.r)));
+    advLast = { start, end, data, times: null, meta: null };
+    renderAdvResults();
   } catch (e) {
     box.innerHTML = `<div class="error-box">${esc(e.message)}</div>`;
   }
