@@ -1211,7 +1211,9 @@ def _taipei_now():
 SERVICE_START = (5, 50)   # 05:50 首班車（之前的查詢時間點）
 SERVICE_END = (23, 0)     # 23:00 末班車之後停止取資料
 WEEKDAY_PEAK_WINDOWS = [((7, 0), (8, 0)), ((17, 0), (18, 0))]   # 週一～五尖峰
-PEAK_INTERVAL_SECONDS = 6 * 60        # 尖峰每 6 分鐘
+PEAK_INTERVAL_SECONDS = 6 * 60        # 尖峰每 6 分鐘（沒有額度餘裕時的基本頻率）
+PEAK_ACTIVE_INTERVAL_SECONDS = 4 * 60 # 有人使用、且額度進度正常時，尖峰改成每 4 分鐘（想要 3 分鐘就改這個數字）
+USER_ACTIVE_WINDOW_SECONDS = 8 * 60   # 最近 8 分鐘內有人操作網站，才算「有人在用」
 OFFPEAK_INTERVAL_SECONDS = 15 * 60    # 平常時段每 15 分鐘
 WEEKEND_INTERVAL_SECONDS = 20 * 60    # 週末（你沒指定，預設 20 分鐘，想改直接改這個數字）
 UBIKE_REFRESH_SECONDS = 3600          # 尖峰時段 UBike 每小時一次
@@ -1235,8 +1237,87 @@ def is_service_hours(now=None):
     return _in_window(now, SERVICE_START, SERVICE_END)
 
 
+# ── 國定假日判斷（項目 2）────────────────────────────────
+# 連假、國定假日當天不會有上下班的尖峰，所以「週一～五」不能只看星期幾：
+#   - 國定假日（平日放假）→ 當週末處理（20 分鐘一次、沒有尖峰、UBike 不抓）
+#   - 補班日（週六上班）→ 當平日處理（有尖峰）
+# 資料來源（不耗 TDX 額度）：開放資料 TaiwanCalendar（政府行事曆整理成 JSON）。
+#   ① 每月最多更新一次（見 refresh_holiday_calendar），存成 data/holidays_年份.json（會跟著備份）
+#   ② 程式裡內建 2026、2027 的假日當後備（網路抓不到時用）
+#   ③ 臨時變動（颱風假、政府公告新增的假日）可以直接在下面兩個集合加日期，格式 "2026-10-24"
+MANUAL_EXTRA_HOLIDAYS = set()   # 額外放假的日子（優先於一切）
+MANUAL_EXTRA_WORKDAYS = set()   # 額外上班的日子（補班，優先度次於上面）
+HOLIDAY_SEEDS = {
+    2026: {"holidays": ["20260101", "20260216", "20260217", "20260218", "20260219", "20260220", "20260227", "20260403", "20260406", "20260501", "20260619", "20260925", "20260928", "20261009", "20261026", "20261225"], "workdays": []},
+    2027: {"holidays": ["20270101", "20270204", "20270205", "20270208", "20270209", "20270210", "20270301", "20270405", "20270406", "20270430", "20270609", "20270915", "20270928", "20271011", "20271025", "20271224", "20271231"], "workdays": []},
+}
+HOLIDAY_API_URLS = [
+    "https://raw.githubusercontent.com/ruyut/TaiwanCalendar/master/data/{year}.json",
+    "https://cdn.jsdelivr.net/gh/ruyut/TaiwanCalendar/data/{year}.json",
+]
+HOLIDAY_REFRESH_DAYS = 30
+HOLIDAY_RETRY_SECONDS = 6 * 3600
+_holiday_last_attempt = {}
+
+
+def _holiday_file(year):
+    return os.path.join(DATA_DIR, f"holidays_{year}.json")
+
+
+def is_workday(now=None):
+    """這一天是不是「上班日」（會有通勤尖峰的日子）。判斷順序：
+    手動額外假日／補班 → 抓下來的整年行事曆 → 內建後備 → 最後才退回「週一～五」。"""
+    d = (now or _taipei_now()).date()
+    iso, ymd = d.isoformat(), d.strftime("%Y%m%d")
+    if iso in MANUAL_EXTRA_HOLIDAYS:
+        return False
+    if iso in MANUAL_EXTRA_WORKDAYS:
+        return True
+    cal = _read_json_cached(_holiday_file(d.year), None)
+    if isinstance(cal, dict) and ymd in cal:
+        return not bool(cal[ymd])
+    seed = HOLIDAY_SEEDS.get(d.year)
+    if seed:
+        if ymd in seed["holidays"]:
+            return False
+        if ymd in seed["workdays"]:
+            return True
+    return d.weekday() < 5
+
+
+def refresh_holiday_calendar():
+    """每個月最多更新一次今年（10 月之後連明年）的行事曆檔案。失敗不影響服務，
+    會繼續用上一份檔案或程式內建的後備資料，並且至少隔 6 小時才再試。"""
+    now = _taipei_now()
+    years = [now.year] + ([now.year + 1] if now.month >= 10 else [])
+    for y in years:
+        path = _holiday_file(y)
+        try:
+            age_days = (time.time() - os.path.getmtime(path)) / 86400
+        except OSError:
+            age_days = None
+        if age_days is not None and age_days < HOLIDAY_REFRESH_DAYS:
+            continue
+        if time.time() - _holiday_last_attempt.get(y, 0) < HOLIDAY_RETRY_SECONDS:
+            continue
+        _holiday_last_attempt[y] = time.time()
+        for url in HOLIDAY_API_URLS:
+            try:
+                res = requests.get(url.format(year=y), timeout=15)
+                rows = res.json() if res.status_code == 200 else None
+                if isinstance(rows, list) and len(rows) >= 360:
+                    cal = {r["date"]: bool(r["isHoliday"]) for r in rows if "date" in r and "isHoliday" in r}
+                    if len(cal) >= 360:
+                        _atomic_write_json(path, cal)
+                        print(f"📅 {y} 年假日行事曆已更新", flush=True)
+                        break
+            except Exception as e:
+                print(f"⚠️ 假日行事曆 {y} 更新失敗（{url.split('/')[2]}）：{e}", flush=True)
+
+
 def is_weekday(now=None):
-    return (now or _taipei_now()).weekday() < 5
+    """相容舊名稱：現在代表「上班日」（會考慮國定假日與補班），不再只看星期幾。"""
+    return is_workday(now)
 
 
 def is_peak_time(now=None):
@@ -1401,7 +1482,7 @@ def _eta_poll_due(interval):
     return time.time() - last >= interval - 5
 
 
-def _eta_poll_once(interval):
+def _eta_poll_once(interval, push=True):
     """向 TDX 抓『全台南到站預估』1 次（含每站車牌／車型），存進快照。"""
     lock_fp = _acquire_flock(REALTIME_LOCK_FILE)
     if lock_fp is None:
@@ -1430,7 +1511,7 @@ def _eta_poll_once(interval):
         _write_realtime_snapshot(write_eta=ok)
 
         global _last_realtime_push_at
-        if time.time() - _last_realtime_push_at >= REALTIME_PUSH_MIN_INTERVAL:
+        if push and time.time() - _last_realtime_push_at >= REALTIME_PUSH_MIN_INTERVAL:
             try:
                 push_realtime_backup(REALTIME_DATA_DIR)
                 _last_realtime_push_at = time.time()
@@ -1558,13 +1639,59 @@ def get_positions_snapshot(route_name=None, max_age=None):
         return [b for lst in by_route.values() for b in lst]
 
 
+# ── 依使用者活動調整輪詢（項目 1）──────────────────────────
+# 沒人開網站就完全不向 TDX 抓到站預估／UBike（離峰、週末、尖峰都一樣）；
+# 有人開網站才恢復，而且「剛有人來」的那一刻會立刻補抓一次，不用等下一輪。
+# 判斷「有人在用」：瀏覽器對 /api/ 發出的請求（前端開著頁面時每分鐘都會有）。
+# 排除：Render 的健康檢查（Go-http-client）、沒有 User-Agent 的請求、HEAD 請求、診斷網址。
+_last_user_activity = 0.0
+_activity_event = threading.Event()
+
+
+def is_user_active():
+    return time.time() - _last_user_activity < USER_ACTIVE_WINDOW_SECONDS
+
+
+@app.before_request
+def _track_user_activity():
+    global _last_user_activity
+    path = request.path
+    if not path.startswith('/api/') or path.startswith('/api/debug_status'):
+        return
+    ua = request.headers.get('User-Agent', '')
+    if request.method == 'HEAD' or not ua or 'Go-http-client' in ua or 'Render' in ua:
+        return
+    was_idle = not is_user_active()
+    _last_user_activity = time.time()
+    if was_idle:
+        _activity_event.set()   # 叫醒背景排程，立刻檢查是否要補抓
+
+
+def ensure_eta_fresh_for_request():
+    """使用者查詢到站時，如果快照已經很舊（例如沒人使用期間輪詢暫停了），就立刻補抓一次，
+    讓第一個進來的人也看得到新資料。仍然遵守：收班時段不抓、額度進度檢查、每個時段間隔只抓一次。"""
+    now = _taipei_now()
+    interval = get_smart_poll_interval(now)
+    if interval is None:
+        return
+    _ensure_realtime_cache_fresh()
+    with _realtime_lock:
+        last = max(_realtime_cache.get("eta_fetched_at") or 0, _realtime_cache.get("last_attempt_ts") or 0)
+    if time.time() - last < interval * 2:
+        return
+    if is_peak_time(now) or _pacing_allows_optional_poll(now):
+        _eta_poll_once(interval, push=False)
+
+
 # ── 背景排程主迴圈 ────────────────────────────────────────
 def _realtime_poll_loop():
-    """每 20 秒醒來看一次「現在該不該抓」（不是睡整段間隔），所以從平常時段切進尖峰時，
-    會在 07:00／17:00 準時開始用 6 分鐘節奏，不會晚一大段。
-      - 到站預估：依 get_smart_poll_interval() 的間隔；平常／週末時段還要過用量進度檢查。
-      - UBike：週一～五尖峰時段每小時 1 次。
-      - 靜態資料：每小時檢查一次本月是否已更新（每月 1 號或當月首次啟動時才真的抓）。
+    """每 20 秒（或有人剛來時立刻）醒來看一次「現在該不該抓」，不是睡整段間隔，所以從平常時段
+    切進尖峰時，會在 07:00／17:00 準時換頻率，不會晚一大段。
+      - 沒人在用網站：不抓到站預估、不抓 UBike（省額度）。
+      - 有人在用：到站預估依 get_smart_poll_interval() 的間隔；尖峰時段額度進度正常的話
+        改成 PEAK_ACTIVE_INTERVAL_SECONDS（4 分鐘）；平常／週末／假日還要過用量進度檢查。
+      - UBike：週一～五（上班日）尖峰時段，有人在用才每小時抓 1 次。
+      - 靜態資料、假日行事曆：每小時檢查一次（真的要抓才抓：每月 1 號或當月首次啟動）。
       - 23:00-05:50：不打任何即時資料請求。"""
     last_static_check = 0
     while True:
@@ -1574,6 +1701,7 @@ def _realtime_poll_loop():
             if time.time() - last_static_check >= 3600:
                 last_static_check = time.time()
                 threading.Thread(target=refresh_static_data, daemon=True).start()
+                threading.Thread(target=refresh_holiday_calendar, daemon=True).start()
             interval = get_smart_poll_interval(now)
             if interval is None:
                 with _realtime_lock:
@@ -1582,13 +1710,18 @@ def _realtime_poll_loop():
             else:
                 with _realtime_lock:
                     _realtime_cache["service_closed"] = False
-                if _eta_poll_due(interval) and (is_peak_time(now) or _pacing_allows_optional_poll(now)):
-                    _eta_poll_once(interval)
-                if _ubike_poll_due(now):
-                    _ubike_poll_once()
+                if is_user_active():
+                    pacing_ok = _pacing_allows_optional_poll(now)
+                    if is_peak_time(now) and pacing_ok:
+                        interval = PEAK_ACTIVE_INTERVAL_SECONDS
+                    if _eta_poll_due(interval) and (is_peak_time(now) or pacing_ok):
+                        _eta_poll_once(interval)
+                    if _ubike_poll_due(now):
+                        _ubike_poll_once()
         except Exception as e:
             print(f"❌ 即時資料排程發生例外：{e}", flush=True)
-        time.sleep(sleep_s)
+        _activity_event.wait(sleep_s)
+        _activity_event.clear()
 
 
 _load_realtime_cache_from_disk()
@@ -1723,6 +1856,301 @@ def find_transfer_routes(stop_index, start_stop, end_stop, max_results=10):
                     if len(results) >= max_results:
                         return results
     return results
+
+
+# ── 轉乘路線規劃（項目 3）────────────────────────────────
+# 完全用本地已存檔的「站序」計算，不打 TDX：
+#   直達：在同一條路線「同一個方向」上，出發站排在目的站前面。
+#   轉乘一次：搭 A 路線在 X 站下車，換同站（或步行 PLAN_WALK_METERS 公尺內的站）的 B 路線，
+#             而且 B 路線的方向要能到目的站。已經有直達的路線不會被當成轉乘的一段。
+# 排序：站數少的在前，轉乘一次視同多搭 PLAN_TRANSFER_PENALTY 站，步行也會加一點分數。
+# 只提供「哪一路、在哪下車」；沒有時刻表，所以不會算出實際等車與轉乘等待時間。
+# 「下一班幾分鐘」只在有現成的到站快照時順便附上（讀快照，不額外查 TDX）。
+PLAN_WALK_METERS = 150
+PLAN_TRANSFER_PENALTY = 8
+_plan_index_cache = {"data": None, "time": 0}
+
+
+@cached(3600)
+def fetch_route_stop_names(route_name):
+    """某路線依方向、依站序的站牌：[{"dir": 0, "stops": [(站名, 緯度, 經度), ...]}, ...]（讀存檔）。"""
+    out = []
+    for entry in load_route_stop_data(route_name):
+        stops = sorted(entry.get("Stops", []), key=lambda s: s.get("StopSequence", 0))
+        seq = []
+        for s in stops:
+            name = (s.get("StopName") or {}).get("Zh_tw", "")
+            pos = s.get("StopPosition") or {}
+            if name:
+                seq.append((name, pos.get("PositionLat"), pos.get("PositionLon")))
+        if seq:
+            out.append({"dir": entry.get("Direction", 0), "stops": seq})
+    return out
+
+
+def build_plan_index():
+    """建立規劃用索引：每條「路線＋方向」的站序，以及「站名 → 在哪些路線的第幾站」。"""
+    now = time.time()
+    c = _plan_index_cache
+    if c["data"] is not None and now - c["time"] < (3600 if c["data"]["seqs"] else 120):
+        return c["data"]
+    seqs, coords, by_name = {}, {}, {}
+    for route in get_all_known_routes():
+        for k, e in enumerate(fetch_route_stop_names(route)):
+            rd = (route, e["dir"], k)
+            seqs[rd] = [st[0] for st in e["stops"]]
+            for i, (name, la, lo) in enumerate(e["stops"]):
+                by_name.setdefault(name, []).append((rd, i))
+                if la and lo and name not in coords:
+                    coords[name] = (la, lo)
+    grid = {}
+    for name, (la, lo) in coords.items():
+        grid.setdefault((round(la / 0.002), round(lo / 0.002)), []).append(name)
+    c["data"] = {"seqs": seqs, "by_name": by_name, "coords": coords, "grid": grid, "walk_memo": {}}
+    c["time"] = now
+    return c["data"]
+
+
+def _transfer_candidates(idx, name):
+    """可以在這站轉乘的站：同名站，加上步行 PLAN_WALK_METERS 公尺內的其他站名。回傳 [(站名, 步行公尺)]。"""
+    memo = idx["walk_memo"]
+    if name in memo:
+        return memo[name]
+    out = [(name, 0)]
+    c = idx["coords"].get(name)
+    if c:
+        gx, gy = round(c[0] / 0.002), round(c[1] / 0.002)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for n2 in idx["grid"].get((gx + dx, gy + dy), []):
+                    if n2 == name:
+                        continue
+                    la2, lo2 = idx["coords"][n2]
+                    d = haversine(c[0], c[1], la2, lo2) * 1000
+                    if d <= PLAN_WALK_METERS:
+                        out.append((n2, int(d)))
+    memo[name] = out
+    return out
+
+
+def _next_bus_minutes(route, direction, stop_name):
+    """從到站快照讀出這條路線在這站「下一班」還要幾分鐘（已依快照年齡修正）；沒資料回傳 None。"""
+    items = fetch_bus_data(route)
+    if not items:
+        return None
+    rt = get_realtime_status()
+    elapsed = max(0.0, time.time() - rt["eta_fetched_at"]) if rt["eta_fetched_at"] else 0.0
+    if elapsed > REALTIME_STALE_SECONDS:
+        return None
+    best = None
+    for it in items:
+        if it.get("Direction") != direction:
+            continue
+        if (it.get("StopName") or {}).get("Zh_tw") != stop_name:
+            continue
+        eta = it.get("EstimateTime")
+        if eta is None:
+            continue
+        eta = max(0, eta - elapsed)
+        if best is None or eta < best:
+            best = eta
+    return None if best is None else int(best // 60)
+
+
+def plan_trip(start, end, max_results=6):
+    """規劃 start → end：回傳直達與轉乘一次的方案（本地計算，不打 TDX）。"""
+    idx = build_plan_index()
+    if not idx["seqs"]:
+        return {"index_ok": False, "direct_plans": [], "transfer_plans": []}
+    seqs, by_name = idx["seqs"], idx["by_name"]
+    starts = by_name.get(start, [])
+    end_map = {}
+    for rd, j in by_name.get(end, []):
+        end_map.setdefault(rd, []).append(j)
+
+    # 直達
+    best_direct, direct_board_idx = {}, {}
+    for rd, i in starts:
+        for j in end_map.get(rd, []):
+            if j > i and (rd not in best_direct or j - i < best_direct[rd]):
+                best_direct[rd] = j - i
+                direct_board_idx[rd] = i
+    direct_plans, seen_direct = [], set()
+    for rd, n in sorted(best_direct.items(), key=lambda kv: (kv[1], kv[0][0])):
+        key = (rd[0], rd[1])
+        if key in seen_direct:
+            continue
+        seen_direct.add(key)
+        direct_plans.append({"id": f"d|{rd[0]}|{rd[1]}", "route": rd[0], "dir": rd[1],
+                             "dest": seqs[rd][-1], "stops": n, "board_idx": direct_board_idx[rd]})
+
+    # 轉乘一次
+    best_t = {}
+    for rd1, i in starts:
+        if rd1 in best_direct:
+            continue                      # 這條自己就能直達，不當轉乘的一段
+        seq1 = seqs[rd1]
+        for k in range(i + 1, len(seq1)):
+            xname = seq1[k]
+            for tname, walk in _transfer_candidates(idx, xname):
+                for rd2, x in by_name.get(tname, []):
+                    if rd2[0] == rd1[0] or rd2 in best_direct:
+                        continue
+                    for j in end_map.get(rd2, []):
+                        if j <= x:
+                            continue
+                        total = (k - i) + (j - x)
+                        score = total + PLAN_TRANSFER_PENALTY + walk / 50.0
+                        key = (rd1[0], rd1[1], rd2[0], rd2[1])
+                        cur = best_t.get(key)
+                        if cur is None or score < cur["score"]:
+                            best_t[key] = {
+                                "id": f"t|{rd1[0]}|{rd1[1]}|{rd2[0]}|{rd2[1]}",
+                                "boardIdxA": i, "boardIdxB": x,
+                                "score": score, "routeA": rd1[0], "dirA": rd1[1], "destA": seq1[-1],
+                                "stopsA": k - i, "transfer": xname, "walk_m": walk,
+                                "board_b": tname, "routeB": rd2[0], "dirB": rd2[1],
+                                "destB": seqs[rd2][-1], "stopsB": j - x, "total_stops": total,
+                            }
+    transfer_plans = sorted(best_t.values(), key=lambda p: p["score"])[:max_results]
+    for p in transfer_plans:
+        p.pop("score", None)
+        p["next_min"] = _next_bus_minutes(p["routeA"], p["dirA"], start)
+    for p in direct_plans[:10]:
+        p["next_min"] = _next_bus_minutes(p["route"], p["dir"], start)
+    return {"index_ok": True, "direct_plans": direct_plans[:12], "transfer_plans": transfer_plans}
+
+
+# ── 轉乘時間估算（「運算轉乘時間」按鈕）──────────────────────
+# 把規劃結果換算成「大約要花幾分鐘、幾點到」。全程用本地資料，不打 TDX：
+#   等第一班車：優先用到站快照的即時預估（已依快照年齡修正），沒有就用今天的固定時刻表推算
+#   搭乘：每站約 PLAN_MIN_PER_STOP 分鐘（跟查詢頁推算沒有資料的站時用的基準一致）
+#   步行轉乘：以每秒 1.2 公尺估算
+#   等第二班車：用今天的固定時刻表，找「抵達轉乘站＋步行之後」最早到站的那一班；
+#              沒有時刻表才用即時預估（而且那班必須在你抵達之後才有意義）
+# 這些都是估算值，不含紅綠燈、塞車與實際到站誤差，畫面上也會這樣標示。
+PLAN_MIN_PER_STOP = 2
+PLAN_WALK_MPS = 1.2
+
+
+def _next_bus_seconds(route, direction, stop_name):
+    """快照裡這條路線在這站「下一班」還要幾秒（已依快照年齡修正）；沒資料回傳 None。"""
+    items = fetch_bus_data(route)
+    if not items:
+        return None
+    rt = get_realtime_status()
+    elapsed = max(0.0, time.time() - rt["eta_fetched_at"]) if rt["eta_fetched_at"] else 0.0
+    if elapsed > REALTIME_STALE_SECONDS:
+        return None
+    best = None
+    for it in items:
+        if it.get("Direction") != direction:
+            continue
+        if (it.get("StopName") or {}).get("Zh_tw") != stop_name:
+            continue
+        eta = it.get("EstimateTime")
+        if eta is None:
+            continue
+        eta = max(0, eta - elapsed)
+        if best is None or eta < best:
+            best = eta
+    return best
+
+
+def _schedule_arrival_offsets(route, direction, stop_idx):
+    """用「今天」的固定時刻表推算：這條路線在第 stop_idx 站，之後每班車還要幾秒到站（由近到遠排序）。
+    發車時間 ＋ 每站 PLAN_MIN_PER_STOP 分鐘。服務日依台北時間判斷，國定假日（平日放假）當週日、
+    補班的週六當週一。沒有時刻表資料回傳空 list。"""
+    raw = fetch_route_schedule(route)
+    if not raw:
+        return []
+    now = _taipei_now().replace(tzinfo=None)
+    wd = now.weekday()
+    if wd < 5 and not is_workday(_taipei_now()):
+        wd = 6
+    elif wd >= 5 and is_workday(_taipei_now()):
+        wd = 0
+    key = _WEEKDAY_KEYS[wd]
+    offsets = []
+    for entry in raw:
+        if entry.get("Direction", 0) != direction:
+            continue
+        for t in entry.get("Timetables", []):
+            svc = t.get("ServiceDay") or {}
+            if svc and not svc.get(key, False):
+                continue
+            dep_str = _timetable_departure_time(t)
+            if not dep_str:
+                continue
+            try:
+                hh, mm = dep_str.split(":")[:2]
+                hh, mm = int(hh), int(mm)
+                dep = now.replace(hour=hh % 24, minute=mm, second=0, microsecond=0) + timedelta(days=hh // 24)
+            except Exception:
+                continue
+            off = (dep - now).total_seconds() + stop_idx * PLAN_MIN_PER_STOP * 60
+            if off >= -60:
+                offsets.append(max(0.0, off))
+    return sorted(offsets)
+
+
+def _fmt_min(sec):
+    return None if sec is None else int(round(sec / 60.0))
+
+
+def estimate_plan_times(start, plans):
+    """替 plan_trip 的結果算出每個方案的預估時間。回傳 {方案 id: 明細}。"""
+    now_tw = _taipei_now()
+    out = {}
+
+    def arrive_text(sec):
+        return (now_tw + timedelta(seconds=sec)).strftime("%H:%M")
+
+    for p in plans.get("direct_plans", []):
+        wait, src = _next_bus_seconds(p["route"], p["dir"], start), "即時"
+        if wait is None:
+            offs = _schedule_arrival_offsets(p["route"], p["dir"], p.get("board_idx", 0))
+            wait, src = (offs[0] if offs else None), "時刻表"
+        ride = p["stops"] * PLAN_MIN_PER_STOP * 60
+        total = None if wait is None else wait + ride
+        out[p["id"]] = {
+            "wait1_min": _fmt_min(wait), "wait1_src": src if wait is not None else None,
+            "ride1_min": _fmt_min(ride), "total_min": _fmt_min(total),
+            "arrive": arrive_text(total) if total is not None else None,
+        }
+
+    for p in plans.get("transfer_plans", []):
+        wait1, src1 = _next_bus_seconds(p["routeA"], p["dirA"], start), "即時"
+        if wait1 is None:
+            offs = _schedule_arrival_offsets(p["routeA"], p["dirA"], p.get("boardIdxA", 0))
+            wait1, src1 = (offs[0] if offs else None), "時刻表"
+        ride1 = p["stopsA"] * PLAN_MIN_PER_STOP * 60
+        walk = (p.get("walk_m", 0) or 0) / PLAN_WALK_MPS
+        ride2 = p["stopsB"] * PLAN_MIN_PER_STOP * 60
+        rec = {"wait1_min": _fmt_min(wait1), "wait1_src": src1 if wait1 is not None else None,
+               "ride1_min": _fmt_min(ride1), "walk_min": _fmt_min(walk) if walk else 0,
+               "ride2_min": _fmt_min(ride2), "wait2_min": None, "wait2_src": None,
+               "total_min": None, "arrive": None, "partial_min": None}
+        if wait1 is None:
+            out[p["id"]] = rec          # 第一班車都估不出來，後面不用算
+            continue
+        ready_b = wait1 + ride1 + walk   # 抵達 B 路線上車站的時間（距離現在幾秒）
+        wait2, src2 = None, None
+        offs = _schedule_arrival_offsets(p["routeB"], p["dirB"], p.get("boardIdxB", 0))
+        later = [o for o in offs if o >= ready_b]
+        if later:
+            wait2, src2 = later[0] - ready_b, "時刻表"
+        else:
+            live = _next_bus_seconds(p["routeB"], p["dirB"], p["board_b"])
+            if live is not None and live >= ready_b:
+                wait2, src2 = live - ready_b, "即時"
+        rec["partial_min"] = _fmt_min(ready_b + ride2)       # 不含第二班車等待時間的最短時間
+        if wait2 is not None:
+            total = ready_b + wait2 + ride2
+            rec.update({"wait2_min": _fmt_min(wait2), "wait2_src": src2,
+                        "total_min": _fmt_min(total), "arrive": arrive_text(total)})
+        out[p["id"]] = rec
+    return out
 
 
 # ── UBike 騎車建議 ────────────────────────────────────────
@@ -2024,6 +2452,7 @@ def api_route_status():
     weather_info = fetch_weather()
     state["current_weather"] = weather_info
 
+    ensure_eta_fresh_for_request()   # 沒人使用期間輪詢是暫停的，第一個進來的人立刻補抓一次
     bus_list = fetch_bus_data(route)
     if bus_list is None:
         return jsonify({"error": "無法取得即時動態"}), 502
@@ -2401,9 +2830,48 @@ def api_advanced_search():
     stop_index = build_stop_route_index()
     if not stop_index:
         return jsonify({"error": "暫時無法取得站點資料，請稍後再試"}), 400
+    # 優先用「依方向、依站序」的規劃（直達要方向對、轉乘要能到得了，附站數與下一班），
+    # 站序資料還沒準備好時才退回舊的「兩站都有經過的路線」粗略比對。
+    try:
+        plans = plan_trip(start, end)
+    except Exception as e:
+        print(f"⚠️ 路線規劃發生例外，退回舊版比對：{e}", flush=True)
+        plans = None
+    if plans and plans.get("index_ok"):
+        directs, seen = [], set()
+        for p in plans["direct_plans"]:
+            if p["route"] not in seen:
+                seen.add(p["route"])
+                directs.append(p["route"])
+        transfers = [{"routeA": p["routeA"], "transfer": p["transfer"], "routeB": p["routeB"]}
+                     for p in plans["transfer_plans"]]
+        return jsonify({"directs": directs, "transfers": transfers,
+                        "direct_plans": plans["direct_plans"],
+                        "transfer_plans": plans["transfer_plans"]})
     directs = find_direct_routes(stop_index, start, end)
     transfers = find_transfer_routes(stop_index, start, end)
     return jsonify({"directs": directs, "transfers": transfers})
+
+
+@app.route('/api/plan_times')
+def api_plan_times():
+    """「運算轉乘時間」按鈕：回傳目前每個直達／轉乘方案的預估時間明細（本地估算，不打 TDX）。
+    用 id 對應 /api/advanced_search 回傳的 direct_plans／transfer_plans。"""
+    start = request.args.get('start', '')
+    end = request.args.get('end', '')
+    if not start or not end or start == end:
+        return jsonify({"error": "請選擇出發站和目的站"}), 400
+    ensure_eta_fresh_for_request()   # 沒人使用期間輪詢暫停了，第一次查詢時先補一份新的到站快照
+    try:
+        plans = plan_trip(start, end)
+        if not plans.get("index_ok"):
+            return jsonify({"error": "站序資料還沒準備好，請稍後再試"}), 400
+        times = estimate_plan_times(start, plans)
+    except Exception as e:
+        print(f"⚠️ 轉乘時間估算失敗：{e}", flush=True)
+        return jsonify({"error": "轉乘時間估算失敗，請稍後再試"}), 500
+    return jsonify({"times": times, "min_per_stop": PLAN_MIN_PER_STOP,
+                    "now": _taipei_now().strftime("%H:%M")})
 
 
 # ══════════════════════════════════════════════════════════
@@ -2748,6 +3216,9 @@ def api_debug_status():
                          **cache_meta},
         "memory_mb": None if _process_rss_mb() is None else round(_process_rss_mb(), 1),
         "memory_limit_mb": MEMORY_LIMIT_MB,
+        "user_active": is_user_active(),
+        "last_activity_seconds_ago": None if not _last_user_activity else int(time.time() - _last_user_activity),
+        "workday_today": is_workday(now),
         "poll_thread_alive": bool(globals().get("realtime_thread") and realtime_thread.is_alive()),
         "static_meta": _read_json_cached(STATIC_META_FILE, {}),
         "saved_route_count": len(get_saved_route_names()),
